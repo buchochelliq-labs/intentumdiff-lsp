@@ -89,11 +89,28 @@ pub fn known_server_specs() -> HashMap<&'static str, ServerSpec> {
             &["OmniSharp", "--languageserver"], 15.0,
             "https://github.com/OmniSharp/omnisharp-roslyn/releases",
         )),
+        // dbt-sql/dbt-yaml: ownership-audit correction — see
+        // `intentumdiff-lsp-provisioning::dbt_fusion` module docs for the full writeup.
+        // `dbt-lsp` is NOT an independently installable command as of this writing: the
+        // language server ships inside the single `dbt` Fusion engine binary, so a bare
+        // `dbt-lsp` on PATH will not resolve for most real installs. This table stays a
+        // static, network-free registry by design (see the module docs at the top of this
+        // file), so it cannot do the version-aware discovery dbt actually needs — callers
+        // targeting dbt-sql/dbt-yaml should go through
+        // `intentumdiff-lsp-provisioning::dbt_fusion::DbtFusionProvisioner` (discovery,
+        // actionable diagnostics, and explicit-consent acquisition) and use its
+        // `resolve_launch_command` for the real spawn command instead of this entry's
+        // `command`. This entry's argv is an unverified placeholder pending confirmation
+        // against a real Fusion binary (see `STDIO_COMMAND_CANDIDATE` in that module).
         ("dbt-sql", ServerSpec::stdio(
-            &["dbt-lsp"], 15.0, "https://docs.getdbt.com/docs/install-dbt-extension",
+            &["dbt", "lsp-server", "--stdio"], 15.0,
+            "https://docs.getdbt.com/docs/about-dbt-lsp (ships with the dbt Fusion engine — \
+             see intentumdiff-lsp-provisioning for guided discovery/install)",
         )),
         ("dbt-yaml", ServerSpec::stdio(
-            &["dbt-lsp"], 15.0, "https://docs.getdbt.com/docs/install-dbt-extension",
+            &["dbt", "lsp-server", "--stdio"], 15.0,
+            "https://docs.getdbt.com/docs/about-dbt-lsp (ships with the dbt Fusion engine — \
+             see intentumdiff-lsp-provisioning for guided discovery/install)",
         )),
     ])
 }

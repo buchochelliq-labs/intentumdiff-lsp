@@ -41,6 +41,9 @@ jobs:
 
       - name: lsp-client tests
         run: cargo test --manifest-path crates/lsp-client/Cargo.toml
+      - name: lsp-provisioning tests
+        # Never touches the network or a real installer by default — see docs/BUILDING.md.
+        run: cargo test --manifest-path crates/lsp-provisioning/Cargo.toml
       - name: lsp-server build + tests
         run: |
           cargo build --release --manifest-path crates/lsp-server/Cargo.toml
