@@ -1,0 +1,46 @@
+# Per-server LSP acquisition/provisioning (issue: dbt-lsp packaging, part of the per-server
+# LSP-server packaging initiative). Deliberately its OWN standalone crate, not folded into
+# intentumdiff-lsp-client:
+#
+# - lsp-client's own manifest states its contract plainly: "nothing in here may know about
+#   SemanticNode or the intentumdiff engine" — it is a generic, reusable LSP codec + client.
+#   Bundling installer/download logic for one specific upstream server (dbt Fusion) into that
+#   crate would violate that contract the same way engine knowledge would.
+# - AGENTS.md's hard invariant ("Do NOT introduce a workspace") applies here too: this crate
+#   is excluded from any workspace root so its own [patch.crates-io] table is honored, and it
+#   builds from its own --manifest-path exactly like its two siblings (see docs/BUILDING.md).
+#
+# Scope: discover an existing, compatible install; produce actionable diagnostics when one is
+# missing or incompatible; and — only on the caller's explicit, per-call opt-in — acquire one
+# through the vendor's OWN official, checksummed distribution channel. This crate never embeds,
+# vendors, or redistributes any upstream binary; see THIRD_PARTY_NOTICES.md.
+
+[package]
+name = "intentumdiff-lsp-provisioning"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Discovery, diagnostics and explicit-consent acquisition for third-party LSP servers (starting with dbt Fusion's dbt-lsp)"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+# Test-only: driving a real initialize+hover exchange against a fake `dbt` subprocess (see
+# tests/dbt_enrichment.rs) reuses the generic client codec rather than reimplementing LSP
+# framing in the test fixture. Not a runtime dependency of this crate's own logic.
+intentumdiff-lsp-client = { path = "../lsp-client" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "process", "sync"] }
+
+[[bin]]
+name = "fake-dbt-lsp"
+path = "tests/fixtures/fake_dbt_lsp.rs"
+required-features = []
+
+[patch.crates-io]
+quote = { path = "../../patches/quote" }
+zmij = { path = "../../patches/zmij" }
+serde_core = { path = "../../patches/serde_core" }
