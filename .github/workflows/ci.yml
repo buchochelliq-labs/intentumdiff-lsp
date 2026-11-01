@@ -22,7 +22,11 @@ jobs:
         with:
           toolchain: 1.95.0
       - name: Cache Rust build artefacts
-        uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            crates/lsp-client
+            crates/lsp-server
       # Phase D: the git dep on the private intentumdiff-core needs an org token wired.
       - name: Authenticate cross-repo git deps
         # Private sibling repos (the SDK / the engine) are git dependencies. GITHUB_TOKEN is
@@ -40,10 +44,10 @@ jobs:
           fi
 
       - name: lsp-client tests
-        run: cargo test --manifest-path crates/lsp-client/Cargo.toml
+        run: cargo test --locked --manifest-path crates/lsp-client/Cargo.toml
       - name: lsp-server build + tests
         run: |
-          cargo build --release --manifest-path crates/lsp-server/Cargo.toml
-          cargo test --manifest-path crates/lsp-server/Cargo.toml
+          cargo build --locked --release --manifest-path crates/lsp-server/Cargo.toml
+          cargo test --locked --manifest-path crates/lsp-server/Cargo.toml
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
