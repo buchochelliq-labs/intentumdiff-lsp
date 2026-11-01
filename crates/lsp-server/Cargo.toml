@@ -17,7 +17,7 @@ name = "intentumdiff-lsp-server"
 path = "src/main.rs"
 
 [dependencies]
-intentumdiff-rust-core = { git = "https://github.com/buchochelliq-labs/intentumdiff-core", tag = "v0.1.1", default-features = false }
+intentumdiff-rust-core = { git = "https://github.com/buchochelliq-labs/intentumdiff-core", rev = "80f9c5bf64ff42ef1b7ddf4124c6b19a7ca7695c", default-features = false }
 intentumdiff-lsp-client = { path = "../lsp-client" }
 serde_json = "1"
 
