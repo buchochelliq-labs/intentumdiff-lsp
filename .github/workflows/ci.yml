@@ -45,9 +45,36 @@ jobs:
 
       - name: lsp-client tests
         run: cargo test --locked --manifest-path crates/lsp-client/Cargo.toml
-      - name: lsp-server build + tests
+      - name: Provision registry-verified parser fixtures
+        # The native editor-session acceptance runs the real binary against real parser
+        # components. Stage exactly the ones it needs from the immutable
+        # intentumdiff-registry pin (REGISTRY_REF in the script: commit -> per-component
+        # SHA-256 -> the parser repo's CI artifact at the pinned ref). Fail-closed: a
+        # missing or mismatching component fails this step. SPLIT_REPO_TOKEN must carry
+        # contents:read on intentumdiff-registry and Actions: Read on the parser repos.
+        run: |
+          python3 -m pip install "pyyaml>=6.0"
+          python3 scripts/provision_lsp_fixtures.py --out "$RUNNER_TEMP/lsp-wasm"
+        env:
+          GH_TOKEN: ${{ secrets.SPLIT_REPO_TOKEN }}
+      - name: lsp-server build + tests (mandatory native acceptance)
+        # INTENTUMDIFF_LSP_REQUIRE_ACCEPTANCE turns any missing/unverified fixture or a
+        # missing git into a failure instead of a self-skip, and records the binary and
+        # component identities in the acceptance record uploaded below.
         run: |
           cargo build --locked --release --manifest-path crates/lsp-server/Cargo.toml
           cargo test --locked --manifest-path crates/lsp-server/Cargo.toml
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          INTENTUMDIFF_TEST_WASM_DIR: ${{ runner.temp }}/lsp-wasm
+          INTENTUMDIFF_LSP_REQUIRE_ACCEPTANCE: "1"
+          INTENTUMDIFF_LSP_ACCEPTANCE_RECORD: ${{ runner.temp }}/lsp-acceptance.json
+      - name: Upload acceptance identities
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lsp-acceptance
+          path: |
+            ${{ runner.temp }}/lsp-acceptance.json
+            ${{ runner.temp }}/lsp-wasm/provenance.json
+          if-no-files-found: warn

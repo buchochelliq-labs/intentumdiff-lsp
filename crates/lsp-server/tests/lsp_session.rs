@@ -1,9 +1,16 @@
 //! End-to-end regression test for the native LSP server (#100 S3): spawn the built binary
 //! and drive a full editor session over stdio, asserting the same flow the manual smoke
 //! covered. Self-contained — reuses the `intentumdiff-lsp-client` codec for its own framing,
-//! shells out to `git` for the fixture, and needs no Python. Skips (passes with a printed
-//! note) when the bundled wasm parsers or `git` are unavailable, so a checkout without built
-//! wasm does not fail the suite.
+//! shells out to `git` for the fixture, and needs no Python.
+//!
+//! Parser fixtures: `INTENTUMDIFF_TEST_WASM_DIR` names an explicit bundle (staged by
+//! `scripts/provision_lsp_fixtures.py`); without it the dev-layout ancestor walk is tried.
+//! The parser-backed sessions skip with a printed note when no bundle or `git` is found —
+//! UNLESS `INTENTUMDIFF_LSP_REQUIRE_ACCEPTANCE=1` (the release/CI gate), which turns a
+//! missing/unverified bundle or missing `git` into a FAILURE, accepts only the explicit
+//! dir, re-hashes every component against the bundle's `provenance.json`, and records the
+//! binary + component identities (stderr, and `INTENTUMDIFF_LSP_ACCEPTANCE_RECORD` when
+//! set). The lifecycle/bounds sessions need no parsers and always run.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -42,6 +49,95 @@ fn git_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+const REQUIRE_ENV: &str = "INTENTUMDIFF_LSP_REQUIRE_ACCEPTANCE";
+
+/// The release/CI gate: parser-backed sessions must run, never skip.
+fn acceptance_required() -> bool {
+    matches!(std::env::var(REQUIRE_ENV).as_deref(), Ok("1") | Ok("true"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Required mode: the explicit bundle must carry a registry-verified `provenance.json`
+/// whose digests match the bytes on disk, and the manifest may only name those
+/// components. Returns the acceptance identity record.
+fn verify_provisioned_bundle(dir: &Path) -> Result<Value, String> {
+    let read_json = |name: &str| -> Result<Value, String> {
+        let text = std::fs::read_to_string(dir.join(name))
+            .map_err(|e| format!("{name} unreadable in {}: {e}", dir.display()))?;
+        serde_json::from_str(&text).map_err(|e| format!("{name} is not JSON: {e}"))
+    };
+    let provenance = read_json("provenance.json")?;
+    if provenance["verified"] != json!(true) {
+        return Err("provenance.json is not registry-verified (provisioned with --no-verify?)".into());
+    }
+    let components = provenance["components"].as_object()
+        .filter(|c| !c.is_empty())
+        .ok_or("provenance.json lists no components")?;
+    let mut identities = serde_json::Map::new();
+    for (name, entry) in components {
+        let bytes = std::fs::read(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+        let digest = sha256_hex(&bytes);
+        if entry["sha256"].as_str() != Some(digest.as_str()) {
+            return Err(format!("{name}: sha256 {digest} does not match provenance {}", entry["sha256"]));
+        }
+        identities.insert(name.clone(), json!(digest));
+    }
+    let manifest = read_json("parser_manifest.json")?;
+    for (language, entry) in manifest["parsers"].as_object().ok_or("manifest has no parsers")? {
+        let wasm = entry["wasm"].as_str().unwrap_or("");
+        if !components.contains_key(wasm) {
+            return Err(format!("manifest language {language} names unprovisioned component {wasm:?}"));
+        }
+    }
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
+    let binary = std::fs::read(bin).map_err(|e| format!("read binary {bin}: {e}"))?;
+    Ok(json!({
+        "binary": {"path": bin, "sha256": sha256_hex(&binary)},
+        "registry_ref": provenance["registry_ref"],
+        "components": identities,
+        "wasm_dir": dir.to_string_lossy(),
+    }))
+}
+
+/// The parser bundle for a parser-backed session, or `None` to skip. In required mode
+/// every gap panics instead, and the identities are recorded once per test process.
+fn acceptance_fixtures() -> Option<PathBuf> {
+    if !acceptance_required() {
+        let Some(dir) = find_wasm_dir() else {
+            eprintln!("skipping: bundled wasm parsers not built (no parser_manifest.json); \
+                       set {REQUIRE_ENV}=1 to make this a failure");
+            return None;
+        };
+        if !git_available() {
+            eprintln!("skipping: git not available");
+            return None;
+        }
+        return Some(dir);
+    }
+    let dir = std::env::var_os("INTENTUMDIFF_TEST_WASM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("{REQUIRE_ENV}=1 but INTENTUMDIFF_TEST_WASM_DIR is not set"));
+    assert!(git_available(), "{REQUIRE_ENV}=1 but git is not available");
+    static RECORD: std::sync::OnceLock<Result<Value, String>> = std::sync::OnceLock::new();
+    let record = RECORD.get_or_init(|| {
+        let record = verify_provisioned_bundle(&dir)?;
+        eprintln!("acceptance identities: {record}");
+        if let Some(path) = std::env::var_os("INTENTUMDIFF_LSP_ACCEPTANCE_RECORD") {
+            std::fs::write(&path, format!("{record:#}\n"))
+                .map_err(|e| format!("write acceptance record: {e}"))?;
+        }
+        Ok(record)
+    });
+    if let Err(e) = record {
+        panic!("{REQUIRE_ENV}=1 but the parser bundle at {} is not acceptable: {e}", dir.display());
+    }
+    Some(dir)
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -176,14 +272,7 @@ fn spawn(bin: &str, repo: &Path, wasm_dir: &Path) -> Session {
 
 #[test]
 fn native_lsp_server_serves_the_full_editor_flow() {
-    let Some(wasm_dir) = find_wasm_dir() else {
-        eprintln!("skipping: bundled wasm parsers not built (no parser_manifest.json)");
-        return;
-    };
-    if !git_available() {
-        eprintln!("skipping: git not available");
-        return;
-    }
+    let Some(wasm_dir) = acceptance_fixtures() else { return; };
     let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
 
     let base = unique_temp_dir();
@@ -328,14 +417,7 @@ fn native_code_lenses_use_the_negotiated_position_encoding() {
     // ECO-04: engine columns are UTF-8 bytes. `/* ééé */ ` is 13 bytes but 10 UTF-16 units,
     // so the rename lens over `function …` must start at character 10 under the default
     // encoding, and stay at the byte column 13 when the client negotiated utf-8.
-    let Some(wasm_dir) = find_wasm_dir() else {
-        eprintln!("skipping: bundled wasm parsers not built (no parser_manifest.json)");
-        return;
-    };
-    if !git_available() {
-        eprintln!("skipping: git not available");
-        return;
-    }
+    let Some(wasm_dir) = acceptance_fixtures() else { return; };
     let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
     let old = "/* ééé */ function foo(a: number) { return a; }\n";
     let new = "/* ééé */ function bar(a: number) { return a; }\n";
@@ -482,14 +564,7 @@ const BROKEN: &str = "function bar(a: number { return a;\n";
 
 /// Start a session over a repo whose committed `s.ts` is `FOO`.
 fn stale_state_session() -> Option<(Session, PathBuf, PathBuf, String)> {
-    let Some(wasm_dir) = find_wasm_dir() else {
-        eprintln!("skipping: bundled wasm parsers not built (no parser_manifest.json)");
-        return None;
-    };
-    if !git_available() {
-        eprintln!("skipping: git not available");
-        return None;
-    }
+    let wasm_dir = acceptance_fixtures()?;
     let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
     let (base, repo) = fixture_repo(&[("s.ts", FOO)]);
     let uri = file_uri(&repo.join("s.ts"));
@@ -689,4 +764,36 @@ fn finish_bare(mut s: Session) {
     s.send(&json!({"jsonrpc": "2.0", "method": "exit", "params": Value::Null}));
     let status = wait_with_deadline(&mut s.child, EXIT_DEADLINE).expect("exit");
     assert!(status.success());
+}
+
+#[test]
+fn required_gate_rejects_unverified_tampered_or_unprovisioned_bundles() {
+    let dir = unique_temp_dir();
+    let bytes = b"\0asm fake component";
+    std::fs::write(dir.join("js_ts_parser.wasm"), bytes).unwrap();
+    let write = |verified: bool, sha: &str, wasm: &str| {
+        std::fs::write(dir.join("provenance.json"), json!({
+            "verified": verified, "registry_ref": "r",
+            "components": {"js_ts_parser.wasm": {"sha256": sha}},
+        }).to_string()).unwrap();
+        std::fs::write(dir.join("parser_manifest.json"), json!({
+            "schema_version": 1, "extension_index": {".ts": "typescript"},
+            "parsers": {"typescript": {"wasm": wasm, "plugin_id": "typescript", "extensions": [".ts"]}},
+        }).to_string()).unwrap();
+    };
+    let good = sha256_hex(bytes);
+    write(true, &good, "js_ts_parser.wasm");
+    let record = verify_provisioned_bundle(&dir).expect("a verified bundle is accepted");
+    assert_eq!(record["components"]["js_ts_parser.wasm"], good.as_str());
+    assert_eq!(record["binary"]["sha256"].as_str().unwrap().len(), 64);
+
+    write(false, &good, "js_ts_parser.wasm");
+    assert!(verify_provisioned_bundle(&dir).unwrap_err().contains("not registry-verified"));
+    write(true, &"0".repeat(64), "js_ts_parser.wasm");
+    assert!(verify_provisioned_bundle(&dir).unwrap_err().contains("does not match"));
+    write(true, &good, "go_parser.wasm");
+    assert!(verify_provisioned_bundle(&dir).unwrap_err().contains("unprovisioned"));
+    std::fs::remove_file(dir.join("provenance.json")).unwrap();
+    assert!(verify_provisioned_bundle(&dir).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }

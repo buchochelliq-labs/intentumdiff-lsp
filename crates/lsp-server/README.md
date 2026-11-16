@@ -68,15 +68,30 @@ verified by `parser_manifest.json`.
 
 ## Testing
 
-`tests/lsp_session.rs` spawns the built binary and drives a full editor session over stdio
-(handshake, an edit → diagnostics + lens refresh, codeLens pull, both `semanticDiff` modes,
-the containment guard, clean exit). It is self-contained — reuses the `intentumdiff-lsp-client`
-codec, shells out to `git` for the fixture, needs no Python — and skips gracefully when the
-bundled wasm parsers or `git` are absent.
+`tests/lsp_session.rs` spawns the built binary and drives real editor sessions over stdio:
+the full flow (handshake, an edit → diagnostics + lens refresh, codeLens pull, both
+`semanticDiff` modes, the containment guard, exit with stdin open), UTF-16/utf-8 lens
+positions, close/declined/failed/out-of-order stale-state regressions, protocol exit, and
+queue/cache bounds. It reuses the `intentumdiff-lsp-client` codec, shells out to `git` for
+fixtures and needs no Python.
+
+The parser-backed sessions need a parser bundle. Stage the registry-verified one CI uses
+(needs a token with read access to `intentumdiff-registry` and the parser repos' Actions):
 
 ```bash
-cargo test          # unit (uri_to_path guards) + the integration session
+pip install "pyyaml>=6.0"
+GH_TOKEN=... python3 scripts/provision_lsp_fixtures.py --out build/lsp-wasm
+INTENTUMDIFF_TEST_WASM_DIR=$PWD/build/lsp-wasm INTENTUMDIFF_LSP_REQUIRE_ACCEPTANCE=1 \
+  cargo test --manifest-path crates/lsp-server/Cargo.toml
 ```
+
+Without `INTENTUMDIFF_LSP_REQUIRE_ACCEPTANCE=1`, those sessions skip with a printed note
+when no bundle (explicit dir or dev-layout ancestor) or `git` is found. With it — as CI runs
+— a missing dir, missing `git`, an unverified (`--no-verify`) bundle, a component whose
+bytes do not match `provenance.json`, or a manifest naming an unprovisioned component FAILS
+the run, and the binary + component SHA-256 identities are printed and written to
+`INTENTUMDIFF_LSP_ACCEPTANCE_RECORD` when set. The lifecycle and bounds sessions need no
+parsers and always run.
 
 ## Cutover
 

@@ -1039,6 +1039,7 @@ dependencies = [
  "intentumdiff-lsp-client",
  "intentumdiff-rust-core",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
