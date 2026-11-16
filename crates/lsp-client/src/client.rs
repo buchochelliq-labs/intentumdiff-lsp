@@ -9,8 +9,12 @@
 //!
 //! Concurrency model mirrors the Python client: a background reader task decodes frames
 //! (via the sans-IO [`FrameDecoder`](crate::FrameDecoder)) and resolves per-request
-//! oneshot futures from a pending map; notifications and server-initiated requests are
-//! discarded; a fatal framing violation or EOF cancels every outstanding request.
+//! oneshot futures from a pending map. Every incoming envelope is classified BEFORE the
+//! pending map is consulted (server request ids are an independent id space): only a
+//! well-formed response (`id` + exactly one of `result`/`error`, no `method`) resolves a
+//! pending request; notifications are discarded; server-initiated requests are answered
+//! with a JSON-RPC `MethodNotFound` error (and mixed method+result envelopes with
+//! `InvalidRequest`). A fatal framing violation or EOF cancels every outstanding request.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -129,7 +133,38 @@ fn which_on(name: &str, path_value: &str) -> Option<PathBuf> {
     None
 }
 
-type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, LspError>>>>>;
+/// Pending client requests by id. A `std` mutex: it is never held across an `.await`, and
+/// it lets [`PendingGuard`] deregister a cancelled request synchronously in `Drop`.
+type PendingMap = Arc<StdMutex<HashMap<i64, oneshot::Sender<Result<Value, LspError>>>>>;
+
+type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
+
+/// JSON-RPC 2.0 error codes the client itself emits when answering server requests.
+const INVALID_REQUEST: i64 = -32600;
+const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Removes a request's pending entry when its future finishes OR is dropped (caller
+/// cancellation), so a late response can never find a stale sender.
+struct PendingGuard<'a> {
+    pending: &'a PendingMap,
+    id: i64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.pending.lock() {
+            map.remove(&self.id);
+        }
+    }
+}
+
+fn lock_pending(
+    pending: &PendingMap,
+) -> std::sync::MutexGuard<'_, HashMap<i64, oneshot::Sender<Result<Value, LspError>>>> {
+    // A poisoned map only means another task panicked mid-insert/remove; the map itself
+    // is still consistent.
+    pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Shared ring buffer of the child's most recent stderr bytes (`_STDERR_RING_BYTES` cap).
 #[derive(Clone, Default)]
@@ -166,7 +201,7 @@ impl StderrRing {
 /// Asyncio-equivalent LSP client. Construct via `connect_stdio` / `connect_tcp` /
 /// `connect_io`; always call [`LspClient::shutdown`] when done.
 pub struct LspClient {
-    writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    writer: SharedWriter,
     pending: PendingMap,
     next_id: AtomicI64,
     timeout: Duration,
@@ -286,13 +321,15 @@ impl LspClient {
         stderr: StderrRing,
         stderr_task: Option<JoinHandle<()>>,
     ) -> Self {
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
         let reader_pending = Arc::clone(&pending);
+        let writer: SharedWriter = Arc::new(Mutex::new(writer));
+        let reader_writer = Arc::clone(&writer);
         let reader_task = tokio::spawn(async move {
-            read_loop(reader, reader_pending).await;
+            read_loop(reader, reader_pending, reader_writer).await;
         });
         Self {
-            writer: Arc::new(Mutex::new(writer)),
+            writer,
             pending,
             next_id: AtomicI64::new(1),
             timeout,
@@ -429,18 +466,16 @@ impl LspClient {
     async fn send_request(&self, method: &str, params: Value) -> Result<Value, LspError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-        if let Err(e) = self.write_frame(&request(method, params, id), method).await {
-            self.pending.lock().await.remove(&id);
-            return Err(e);
-        }
+        lock_pending(&self.pending).insert(id, tx);
+        // Deregisters on every exit path, including the caller dropping this future.
+        let _guard = PendingGuard { pending: &self.pending, id };
+        self.write_frame(&request(method, params, id), method).await?;
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(LspError::Connection(format!(
                 "LSP server closed the connection during {method:?}"
             ))),
             Err(_) => {
-                self.pending.lock().await.remove(&id);
                 Err(LspError::Timeout(format!(
                     "No response to {method:?} within {:?}",
                     self.timeout
@@ -474,10 +509,15 @@ impl Drop for LspClient {
     }
 }
 
-/// The background reader: decode frames, resolve pending requests, discard notifications.
-/// On EOF or a fatal framing violation, cancel every outstanding request (dropping the
-/// senders wakes the callers with a connection error).
-async fn read_loop(mut reader: Box<dyn AsyncRead + Unpin + Send>, pending: PendingMap) {
+/// The background reader: decode frames, classify each envelope, resolve pending requests
+/// from responses only, answer server requests. On EOF or a fatal framing violation,
+/// cancel every outstanding request (dropping the senders wakes the callers with a
+/// connection error).
+async fn read_loop(
+    mut reader: Box<dyn AsyncRead + Unpin + Send>,
+    pending: PendingMap,
+    writer: SharedWriter,
+) {
     let mut decoder = FrameDecoder::new();
     let mut chunk = [0u8; 8_192];
     'outer: loop {
@@ -489,7 +529,11 @@ async fn read_loop(mut reader: Box<dyn AsyncRead + Unpin + Send>, pending: Pendi
         loop {
             match decoder.next_event() {
                 Ok(Some(DecodeEvent::Frame(msg))) => {
-                    dispatch_message(&msg, &pending).await;
+                    if let Some(reply) = dispatch_message(&msg, &pending) {
+                        let mut w = writer.lock().await;
+                        let _ = w.write_all(&encode_message(&reply)).await;
+                        let _ = w.flush().await;
+                    }
                 }
                 Ok(Some(DecodeEvent::MalformedFrame)) => {}
                 Ok(None) => break,
@@ -497,29 +541,82 @@ async fn read_loop(mut reader: Box<dyn AsyncRead + Unpin + Send>, pending: Pendi
             }
         }
     }
-    pending.lock().await.clear();
+    lock_pending(&pending).clear();
 }
 
-async fn dispatch_message(msg: &Value, pending: &PendingMap) {
-    let Some(id) = msg.get("id").and_then(Value::as_i64) else {
-        return; // server notification — ignore
-    };
-    let Some(tx) = pending.lock().await.remove(&id) else {
-        return;
-    };
-    let outcome = if let Some(err) = msg.get("error") {
-        Err(LspError::Server {
-            code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
-            message: err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-        })
-    } else {
-        Ok(msg.get("result").cloned().unwrap_or(Value::Null))
-    };
-    let _ = tx.send(outcome);
+/// The shape of one incoming JSON-RPC envelope, decided before any pending-id lookup.
+#[derive(Debug, PartialEq)]
+enum Envelope {
+    /// `method` + `id`, no `result`/`error`: a server→client request.
+    Request,
+    /// `method`, no `id`: a notification.
+    Notification,
+    /// `id` + exactly one of `result`/`error`, no `method`: a response.
+    Response,
+    /// Anything else (mixed method+result, result+error, neither, non-object…).
+    Invalid,
+}
+
+fn classify(msg: &Value) -> Envelope {
+    let Some(obj) = msg.as_object() else { return Envelope::Invalid };
+    let has_method = obj.get("method").is_some_and(Value::is_string);
+    let has_id = obj.contains_key("id");
+    let has_result = obj.contains_key("result");
+    let has_error = obj.contains_key("error");
+    match (has_method, has_id, has_result || has_error) {
+        (true, true, false) => Envelope::Request,
+        (true, false, false) => Envelope::Notification,
+        (false, true, true) if has_result != has_error => Envelope::Response,
+        _ => Envelope::Invalid,
+    }
+}
+
+/// Handle one envelope; returns the reply frame to write back, if any.
+fn dispatch_message(msg: &Value, pending: &PendingMap) -> Option<Value> {
+    match classify(msg) {
+        Envelope::Notification => None,
+        Envelope::Request => {
+            let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": msg["id"],
+                "error": {
+                    "code": METHOD_NOT_FOUND,
+                    "message": format!("Unhandled method {method}"),
+                },
+            }))
+        }
+        Envelope::Invalid => {
+            // Only an envelope that names a request (method + usable id) gets an
+            // InvalidRequest answer; malformed responses are dropped — answering a
+            // response would itself be a protocol violation.
+            let id = msg.get("id").filter(|id| id.is_string() || id.is_number())?;
+            msg.get("method")?;
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": INVALID_REQUEST, "message": "Invalid request envelope"},
+            }))
+        }
+        Envelope::Response => {
+            let id = msg.get("id").and_then(Value::as_i64)?;
+            let tx = lock_pending(pending).remove(&id)?;
+            let outcome = if let Some(err) = msg.get("error") {
+                Err(LspError::Server {
+                    code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
+                    message: err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                })
+            } else {
+                Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+            };
+            let _ = tx.send(outcome);
+            None
+        }
+    }
 }
 
 /// Hover `contents` → plain text, ported shape-for-shape from `AsyncLspClient.hover`.
@@ -796,6 +893,198 @@ mod tests {
             matches!(err, LspError::Connection(_)) || matches!(err, LspError::Timeout(_)),
             "got: {err}"
         );
+    }
+
+    /// A scripted peer that reads client frames and, for each one, lets `script` decide
+    /// which raw frames to write back. Returns every frame the client sent.
+    fn scripted_peer<F>(io: tokio::io::DuplexStream, mut script: F) -> JoinHandle<Vec<Value>>
+    where
+        F: FnMut(&Value) -> Vec<Value> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(io);
+            let mut decoder = FrameDecoder::new();
+            let mut chunk = [0u8; 4096];
+            let mut received = Vec::new();
+            loop {
+                let n = match reader.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                decoder.feed(&chunk[..n]);
+                while let Ok(Some(DecodeEvent::Frame(msg))) = decoder.next_event() {
+                    for reply in script(&msg) {
+                        let _ = writer.write_all(&encode_message(&reply)).await;
+                        let _ = writer.flush().await;
+                    }
+                    received.push(msg);
+                }
+            }
+            received
+        })
+    }
+
+    #[tokio::test]
+    async fn server_request_with_colliding_id_does_not_complete_initialize() {
+        // ECO-03 reproduction: the peer answers initialize (id=1) ONLY with a server→client
+        // request that happens to reuse id 1. That must not resolve the pending initialize.
+        let (client_io, peer_io) = duplex(1 << 16);
+        let peer = scripted_peer(peer_io, |msg| {
+            if msg.get("method").and_then(Value::as_str) == Some("initialize") {
+                vec![json!({"jsonrpc": "2.0", "id": msg["id"], "method": "workspace/configuration",
+                            "params": {"items": []}})]
+            } else {
+                vec![]
+            }
+        });
+        let (r, w) = tokio::io::split(client_io);
+        let result = LspClient::connect_io(
+            Box::new(r),
+            Box::new(w),
+            "file:///ws",
+            Duration::from_millis(100),
+        )
+        .await;
+        let err = result.err().expect("initialize must not succeed on a server request");
+        assert!(matches!(err, LspError::Timeout(_)), "got: {err}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        peer.abort();
+    }
+
+    #[tokio::test]
+    async fn unsupported_server_requests_get_a_method_not_found_error() {
+        let (client_io, peer_io) = duplex(1 << 16);
+        let peer = scripted_peer(peer_io, |msg| {
+            match (msg.get("method").and_then(Value::as_str), msg.get("id")) {
+                // Server request first (string id), then the real initialize response.
+                (Some("initialize"), Some(id)) => vec![
+                    json!({"jsonrpc": "2.0", "id": "srv-1", "method": "window/workDoneProgress/create",
+                           "params": {"token": "t"}}),
+                    json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                ],
+                (Some("shutdown"), Some(id)) => vec![json!({"jsonrpc": "2.0", "id": id, "result": null})],
+                _ => vec![],
+            }
+        });
+        let (r, w) = tokio::io::split(client_io);
+        let client = LspClient::connect_io(Box::new(r), Box::new(w), "file:///ws", Duration::from_secs(2))
+            .await
+            .expect("handshake");
+        client.shutdown().await.unwrap();
+        let received = peer.await.unwrap();
+        let answer = received
+            .iter()
+            .find(|m| m.get("id") == Some(&json!("srv-1")))
+            .expect("the client must answer the server request");
+        assert!(answer.get("method").is_none(), "an answer is a response, not a request");
+        assert!(answer.get("result").is_none());
+        assert_eq!(answer["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn only_well_formed_responses_resolve_pending_requests() {
+        // Before the real hover result arrives, the peer sends: a notification, a server
+        // request and a mixed method+result envelope reusing the hover id, and a response
+        // carrying both result and error. None may resolve the hover.
+        let (client_io, peer_io) = duplex(1 << 16);
+        let peer = scripted_peer(peer_io, |msg| {
+            let id = msg.get("id").cloned();
+            match (msg.get("method").and_then(Value::as_str), id) {
+                (Some("initialize"), Some(id)) => vec![json!({"jsonrpc": "2.0", "id": id, "result": {}})],
+                (Some("textDocument/hover"), Some(id)) => vec![
+                    json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {"type": 3, "message": "x"}}),
+                    json!({"jsonrpc": "2.0", "id": id, "method": "workspace/configuration", "params": {}}),
+                    json!({"jsonrpc": "2.0", "id": id, "method": "bogus", "result": {"contents": "mixed"}}),
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"contents": "both"},
+                           "error": {"code": 1, "message": "both"}}),
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"contents": "real"}}),
+                ],
+                (Some("shutdown"), Some(id)) => vec![json!({"jsonrpc": "2.0", "id": id, "result": null})],
+                _ => vec![],
+            }
+        });
+        let (r, w) = tokio::io::split(client_io);
+        let client = LspClient::connect_io(Box::new(r), Box::new(w), "file:///ws", Duration::from_secs(2))
+            .await
+            .expect("handshake");
+        assert_eq!(client.hover("u", 0, 0).await.unwrap(), Some("real".to_owned()));
+        client.shutdown().await.unwrap();
+        let received = peer.await.unwrap();
+        // The server request and the mixed envelope were each answered with an error; the
+        // notification and the malformed response were not answered.
+        let answers: Vec<&Value> = received
+            .iter()
+            .filter(|m| m.get("method").is_none() && m.get("error").is_some())
+            .collect();
+        assert_eq!(answers.len(), 2, "got {received:?}");
+        let codes: Vec<i64> = answers.iter().map(|a| a["error"]["code"].as_i64().unwrap()).collect();
+        assert_eq!(codes, vec![-32601, -32600]);
+    }
+
+    #[tokio::test]
+    async fn late_responses_after_timeout_or_cancellation_are_dropped() {
+        // The peer answers hover #1 only after hover #2 has been sent, and answers hover #2
+        // correctly. The late answer must not leak into hover #2.
+        let (client_io, peer_io) = duplex(1 << 16);
+        let mut held: Option<Value> = None;
+        let peer = scripted_peer(peer_io, move |msg| {
+            let id = msg.get("id").cloned();
+            match (msg.get("method").and_then(Value::as_str), id) {
+                (Some("initialize"), Some(id)) => vec![json!({"jsonrpc": "2.0", "id": id, "result": {}})],
+                (Some("textDocument/hover"), Some(id)) => match held.take() {
+                    None => {
+                        held = Some(id);
+                        vec![]
+                    }
+                    Some(first) => vec![
+                        json!({"jsonrpc": "2.0", "id": first, "result": {"contents": "late"}}),
+                        json!({"jsonrpc": "2.0", "id": id, "result": {"contents": "second"}}),
+                    ],
+                },
+                (Some("shutdown"), Some(id)) => vec![json!({"jsonrpc": "2.0", "id": id, "result": null})],
+                _ => vec![],
+            }
+        });
+        let (r, w) = tokio::io::split(client_io);
+        let client = LspClient::connect_io(Box::new(r), Box::new(w), "file:///ws", Duration::from_millis(150))
+            .await
+            .expect("handshake");
+        // Cancel the first request by dropping its future before it resolves.
+        let first = tokio::time::timeout(Duration::from_millis(50), client.hover("u", 0, 0)).await;
+        assert!(first.is_err(), "first hover must still be pending when cancelled");
+        assert!(client.pending.lock().expect("pending").is_empty(), "cancelled request left pending");
+        assert_eq!(client.hover("u", 0, 1).await.unwrap(), Some("second".to_owned()));
+        client.shutdown().await.unwrap();
+        peer.abort();
+    }
+
+    #[test]
+    fn envelopes_are_classified_before_any_pending_lookup() {
+        use Envelope::*;
+        let cases = [
+            (json!({"jsonrpc": "2.0", "id": 1, "method": "m"}), Request),
+            (json!({"jsonrpc": "2.0", "id": "s", "method": "m", "params": {}}), Request),
+            (json!({"jsonrpc": "2.0", "method": "m"}), Notification),
+            (json!({"jsonrpc": "2.0", "id": 1, "result": null}), Response),
+            (json!({"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": ""}}), Response),
+            (json!({"jsonrpc": "2.0", "id": 1, "method": "m", "result": 1}), Invalid),
+            (json!({"jsonrpc": "2.0", "id": 1, "result": 1, "error": {}}), Invalid),
+            (json!({"jsonrpc": "2.0", "id": 1}), Invalid),
+            (json!({"jsonrpc": "2.0", "result": 1}), Invalid),
+            (json!([1, 2]), Invalid),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(classify(&msg), want, "{msg}");
+        }
+        // A pending id is never consumed by a non-response envelope.
+        let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        lock_pending(&pending).insert(1, tx);
+        let reply = dispatch_message(&json!({"jsonrpc": "2.0", "id": 1, "method": "m"}), &pending);
+        assert_eq!(reply.unwrap()["error"]["code"], METHOD_NOT_FOUND);
+        assert!(lock_pending(&pending).contains_key(&1));
+        assert!(dispatch_message(&json!({"jsonrpc": "2.0", "id": 1, "result": 7}), &pending).is_none());
+        assert!(lock_pending(&pending).is_empty());
     }
 
     #[test]
