@@ -75,6 +75,29 @@ fn unique_temp_dir() -> PathBuf {
     dir
 }
 
+/// The documented bound for protocol `exit` to end the process (generous for debug CI).
+const EXIT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Poll `child` until it exits or `deadline` passes; on timeout the child is killed and
+/// `None` is returned, so a hung server fails the test instead of hanging it.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    deadline: Duration,
+) -> Option<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return Some(status);
+        }
+        if start.elapsed() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 struct Session {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
@@ -262,8 +285,8 @@ fn native_lsp_server_serves_the_full_editor_flow() {
     s.send(&json!({"jsonrpc": "2.0", "id": 6, "method": "shutdown", "params": Value::Null}));
     assert!(s.recv_response(6)["result"].is_null());
     s.send(&json!({"jsonrpc": "2.0", "method": "exit", "params": Value::Null}));
-    drop(s.stdin);
-    let status = s.child.wait().expect("wait");
+    // stdin stays open: protocol exit alone must end the process (ECO-09-EXIT).
+    let status = wait_with_deadline(&mut s.child, EXIT_DEADLINE).expect("exit must not wait for EOF");
     assert!(status.success(), "clean exit expected, got {status:?}");
 
     let _ = std::fs::remove_dir_all(&base);
@@ -352,8 +375,63 @@ fn native_code_lenses_use_the_negotiated_position_encoding() {
         s.send(&json!({"jsonrpc": "2.0", "id": 9, "method": "shutdown", "params": Value::Null}));
         s.recv_response(9);
         s.send(&json!({"jsonrpc": "2.0", "method": "exit", "params": Value::Null}));
-        drop(s.stdin);
-        assert!(s.child.wait().expect("wait").success());
+        let status = wait_with_deadline(&mut s.child, EXIT_DEADLINE).expect("exit must not wait for EOF");
+        assert!(status.success());
     }
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A bare session: no workspace root, no parser bundle, no git — protocol lifecycle only.
+fn spawn_bare() -> Session {
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
+    let dir = std::env::temp_dir();
+    spawn(bin, &dir, &dir.join("no-such-wasm-dir"))
+}
+
+fn initialize_bare(s: &mut Session) {
+    s.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"capabilities": {}}}));
+    s.recv_response(1);
+    s.send(&json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+}
+
+#[test]
+fn exit_after_shutdown_terminates_with_stdin_still_open() {
+    let mut s = spawn_bare();
+    initialize_bare(&mut s);
+    s.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": Value::Null}));
+    assert!(s.recv_response(2)["result"].is_null());
+    s.send(&json!({"jsonrpc": "2.0", "method": "exit", "params": Value::Null}));
+    // Deliberately keep `s.stdin` alive until after the wait.
+    let status = wait_with_deadline(&mut s.child, EXIT_DEADLINE);
+    let status = status.expect("server ignored exit while stdin was open");
+    assert_eq!(status.code(), Some(0));
+    drop(s.stdin);
+}
+
+#[test]
+fn exit_without_shutdown_terminates_with_code_1() {
+    // LSP 3.17: `exit` without a prior `shutdown` exits with code 1.
+    let mut s = spawn_bare();
+    initialize_bare(&mut s);
+    s.send(&json!({"jsonrpc": "2.0", "method": "exit", "params": Value::Null}));
+    let status = wait_with_deadline(&mut s.child, EXIT_DEADLINE);
+    assert_eq!(status.expect("server ignored exit while stdin was open").code(), Some(1));
+    drop(s.stdin);
+}
+
+#[test]
+fn requests_after_shutdown_are_rejected_and_eof_still_exits() {
+    let mut s = spawn_bare();
+    initialize_bare(&mut s);
+    s.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": Value::Null}));
+    s.recv_response(2);
+    s.send(&json!({"jsonrpc": "2.0", "id": 3, "method": "textDocument/codeLens",
+                   "params": {"textDocument": {"uri": "file:///x.ts"}}}));
+    let rejected = s.recv_response(3);
+    assert_eq!(rejected["error"]["code"], -32600, "got {rejected}");
+    // EOF (client vanished without exit) still ends the process cleanly.
+    drop(s.stdin);
+    let status = wait_with_deadline(&mut s.child, EXIT_DEADLINE).expect("EOF must end the server");
+    assert!(status.success(), "got {status:?}");
 }

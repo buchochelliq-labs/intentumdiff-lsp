@@ -30,7 +30,7 @@ Standard LSP 3.17 over stdio, plus one custom method:
 | `textDocument/didClose` | Drops the cached diff and buffer. |
 | `textDocument/codeLens` | Returns refactoring-family lenses mapped from the last computed diff (pull, from cache). |
 | `intentumdiff/semanticDiff` | `oldUri == newUri`: the live buffer (or on-disk file) vs the ref. Distinct URIs: a workspace-contained two-file compare. Errors are in-band `{"error": …}`. |
-| `shutdown` / `exit` | Clean exit, no orphaned threads (#73). |
+| `shutdown` / `exit` | `shutdown` → `null`; later requests get `-32600`. `exit` terminates the process at once — code 0 after `shutdown`, 1 without — even while stdin stays open; EOF also exits cleanly (#73). |
 
 **Compute** is the engine's live-diff path (config-aware, all-language, guardrails included):
 the server reads the ref baseline once through the core's strict Git reader and diffs exactly

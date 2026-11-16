@@ -165,6 +165,8 @@ struct ServerState {
     content_cache: HashMap<String, String>,
     /// id source for server→client requests (codeLens refresh).
     next_server_id: i64,
+    /// `shutdown` was received: every later request except `exit` is InvalidRequest.
+    shutdown_requested: bool,
 }
 
 /// LSP `PositionEncodingKind` this server can emit.
@@ -327,10 +329,13 @@ fn main() {
         lens_cache: HashMap::new(),
         content_cache: HashMap::new(),
         next_server_id: 1,
+        shutdown_requested: false,
     };
 
     // Reader thread: bytes → frames → channel. Exits on EOF/fatal framing; dropping the
-    // sender ends the main loop (#73: one thread, joined, nothing orphaned).
+    // sender ends the main loop (#73: one thread, joined, nothing orphaned). A blocking
+    // stdin read cannot be cancelled portably, so protocol `exit` does NOT join it: the
+    // process terminates instead (see the end of `main`).
     let (tx, rx) = mpsc::channel::<Value>();
     let reader = std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
@@ -359,6 +364,8 @@ fn main() {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    // Set by protocol `exit`: 0 after `shutdown`, 1 without (LSP 3.17).
+    let mut exit_code: Option<i32> = None;
 
     'main: while let Ok(first) = rx.recv() {
         // Debounce by coalescing: drain whatever is already buffered, then keep only the
@@ -375,6 +382,12 @@ fn main() {
             }
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
             let id = msg.get("id");
+            if state.shutdown_requested && method != "exit" {
+                if let Some(id) = id {
+                    respond_error(&mut out, id, -32600, "server is shutting down");
+                }
+                continue;
+            }
             match method {
                 "initialize" => {
                     let root_uri = params
@@ -474,11 +487,15 @@ fn main() {
                     }
                 }
                 "shutdown" => {
+                    state.shutdown_requested = true;
                     if let Some(id) = id {
                         respond(&mut out, id, Value::Null);
                     }
                 }
-                "exit" => break 'main,
+                "exit" => {
+                    exit_code = Some(if state.shutdown_requested { 0 } else { 1 });
+                    break 'main;
+                }
                 _ => {
                     if let Some(id) = id {
                         respond_error(&mut out, id, -32601, &format!("method not found: {method}"));
@@ -493,6 +510,16 @@ fn main() {
         }
     }
 
+    let _ = out.flush();
+    drop(out);
+    if let Some(code) = exit_code {
+        // Protocol exit: the reader may be parked in a blocking stdin read that only EOF
+        // would release. Terminating the process ends it immediately and leaves nothing
+        // orphaned (it is a thread of this process); stdout is already flushed.
+        std::process::exit(code);
+    }
+    // EOF / fatal framing: the reader has already returned (that is what closed the
+    // channel), so this join is immediate.
     drop(rx);
     let _ = reader.join();
 }
