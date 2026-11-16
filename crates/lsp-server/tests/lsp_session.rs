@@ -435,3 +435,157 @@ fn requests_after_shutdown_are_rejected_and_eof_still_exits() {
     let status = wait_with_deadline(&mut s.child, EXIT_DEADLINE).expect("EOF must end the server");
     assert!(status.success(), "got {status:?}");
 }
+
+impl Session {
+    /// Drain frames until a `publishDiagnostics` for `uri`, acking server requests.
+    fn recv_publish(&mut self, uri: &str) -> Value {
+        loop {
+            let msg = self.recv();
+            let Some(method) = msg.get("method").and_then(Value::as_str) else { continue };
+            self.seen_notifications.push(method.to_owned());
+            if let Some(id) = msg.get("id") {
+                self.send(&json!({"jsonrpc": "2.0", "id": id, "result": Value::Null}));
+                continue;
+            }
+            if method == "textDocument/publishDiagnostics" && msg["params"]["uri"] == uri {
+                return msg["params"].clone();
+            }
+        }
+    }
+
+    fn code_lenses(&mut self, uri: &str, id: i64) -> Vec<Value> {
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/codeLens",
+                          "params": {"textDocument": {"uri": uri}}}));
+        self.recv_response(id)["result"].as_array().cloned().expect("codeLens array")
+    }
+
+    fn open(&mut self, uri: &str, version: i64, text: &str) {
+        self.send(&json!({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": {"textDocument": {"uri": uri, "languageId": "typescript",
+                                        "version": version, "text": text}}}));
+    }
+
+    fn change(&mut self, uri: &str, version: i64, text: &str) {
+        self.send(&json!({"jsonrpc": "2.0", "method": "textDocument/didChange",
+            "params": {"textDocument": {"uri": uri, "version": version},
+                       "contentChanges": [{"text": text}]}}));
+    }
+}
+
+fn has_rename(lenses: &[Value]) -> bool {
+    lenses.iter().any(|l| l["command"]["title"].as_str().unwrap_or("").contains("RENAME"))
+}
+
+const FOO: &str = "function foo(a: number) { return a; }\n";
+const BAR: &str = "function bar(a: number) { return a; }\n";
+const BROKEN: &str = "function bar(a: number { return a;\n";
+
+/// Start a session over a repo whose committed `s.ts` is `FOO`.
+fn stale_state_session() -> Option<(Session, PathBuf, PathBuf, String)> {
+    let Some(wasm_dir) = find_wasm_dir() else {
+        eprintln!("skipping: bundled wasm parsers not built (no parser_manifest.json)");
+        return None;
+    };
+    if !git_available() {
+        eprintln!("skipping: git not available");
+        return None;
+    }
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
+    let (base, repo) = fixture_repo(&[("s.ts", FOO)]);
+    let uri = file_uri(&repo.join("s.ts"));
+    let mut s = spawn(bin, &repo, &wasm_dir);
+    s.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"rootUri": file_uri(&repo),
+                   "capabilities": {"workspace": {"codeLens": {"refreshSupport": true}}}}}));
+    s.recv_response(1);
+    s.send(&json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    Some((s, base, repo, uri))
+}
+
+fn finish(mut s: Session, base: &Path) {
+    s.send(&json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": Value::Null}));
+    s.recv_response(99);
+    s.send(&json!({"jsonrpc": "2.0", "method": "exit", "params": Value::Null}));
+    let status = wait_with_deadline(&mut s.child, EXIT_DEADLINE).expect("exit");
+    assert!(status.success());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn close_clears_diagnostics_and_lenses_and_reopen_restores_them() {
+    let Some((mut s, base, _repo, uri)) = stale_state_session() else { return };
+    s.open(&uri, 1, BAR);
+    assert_eq!(s.recv_publish(&uri)["version"], 1);
+    assert!(has_rename(&s.code_lenses(&uri, 2)));
+
+    s.send(&json!({"jsonrpc": "2.0", "method": "textDocument/didClose",
+                   "params": {"textDocument": {"uri": uri}}}));
+    let cleared = s.recv_publish(&uri);
+    assert_eq!(cleared["diagnostics"], json!([]), "close must clear diagnostics");
+    assert!(s.code_lenses(&uri, 3).is_empty(), "close must drop lenses");
+
+    // Reopening recomputes from the reopened buffer's own version.
+    s.open(&uri, 7, BAR);
+    assert_eq!(s.recv_publish(&uri)["version"], 7);
+    assert!(has_rename(&s.code_lenses(&uri, 4)));
+    finish(s, &base);
+}
+
+#[test]
+fn a_declined_revision_clears_the_previous_results() {
+    let Some((mut s, base, _repo, uri)) = stale_state_session() else { return };
+    s.open(&uri, 1, BAR);
+    s.recv_publish(&uri);
+    assert!(has_rename(&s.code_lenses(&uri, 2)));
+
+    // Invalid syntax → the engine declines (fallback). The rename lens and diagnostics of
+    // version 1 must not survive as if they described version 2.
+    s.change(&uri, 2, BROKEN);
+    let published = s.recv_publish(&uri);
+    assert_eq!(published["version"], 2);
+    assert_eq!(published["diagnostics"], json!([]));
+    assert!(s.code_lenses(&uri, 3).is_empty(), "stale lenses survived a declined revision");
+    finish(s, &base);
+}
+
+#[test]
+fn a_failed_revision_clears_results_and_reports_why() {
+    let Some((mut s, base, repo, uri)) = stale_state_session() else { return };
+    s.open(&uri, 1, BAR);
+    s.recv_publish(&uri);
+    assert!(has_rename(&s.code_lenses(&uri, 2)));
+
+    // Break the baseline: the ref can no longer be resolved → compute fails.
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    s.change(&uri, 2, FOO);
+    let published = s.recv_publish(&uri);
+    assert_eq!(published["version"], 2);
+    let diags = published["diagnostics"].as_array().unwrap();
+    assert_eq!(diags.len(), 1, "expected one provenance diagnostic, got {diags:?}");
+    assert_eq!(diags[0]["source"], "intentumdiff");
+    assert_eq!(diags[0]["severity"], 3);
+    assert!(diags[0]["message"].as_str().unwrap().contains("unavailable"));
+    assert!(s.code_lenses(&uri, 3).is_empty(), "stale lenses survived a failed revision");
+    finish(s, &base);
+}
+
+#[test]
+fn out_of_order_changes_cannot_overwrite_a_newer_revision() {
+    let Some((mut s, base, _repo, uri)) = stale_state_session() else { return };
+    s.open(&uri, 1, FOO);
+    s.recv_publish(&uri);
+    // Version 3 (the rename) arrives before a late version 2 (no change).
+    s.change(&uri, 3, BAR);
+    s.change(&uri, 2, FOO);
+    let published = s.recv_publish(&uri);
+    assert_eq!(published["version"], 3, "got {published}");
+    assert!(has_rename(&s.code_lenses(&uri, 2)), "late v2 overwrote v3");
+    // Same-URI semanticDiff also serves the newest buffer.
+    s.send(&json!({"jsonrpc": "2.0", "id": 3, "method": "intentumdiff/semanticDiff",
+                   "params": {"oldUri": uri, "newUri": uri}}));
+    let diff = s.recv_response(3);
+    let types: Vec<&str> = diff["result"]["changes"].as_array().unwrap().iter()
+        .filter_map(|c| c["change_type"].as_str()).collect();
+    assert!(types.contains(&"REFACTORING"), "got {types:?}");
+    finish(s, &base);
+}

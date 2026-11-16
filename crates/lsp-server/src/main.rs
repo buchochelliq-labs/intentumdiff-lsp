@@ -14,8 +14,13 @@
 //!   computing, the main loop drains everything already buffered and keeps only the LATEST
 //!   content per URI — a burst of `didChange` costs one diff. No timers, no async runtime,
 //!   one thread, clean #73 exit on EOF.
-//! - Engine fallbacks (`{"fallback": …}`) publish no diagnostics for that revision — the
-//!   pygls server's `diff is None` behaviour.
+//! - **No stale results**: every publish carries the document version it was computed
+//!   from; a `didChange` whose version is not newer than the buffer's is dropped. A
+//!   revision the engine declines (`{"fallback": …}`) publishes EMPTY diagnostics and drops
+//!   its lenses; a revision whose compute fails publishes one Information diagnostic that
+//!   says why (never relabelled as a clean diff) and drops its lenses; `didClose` publishes
+//!   empty diagnostics and drops lenses. Lens drops trigger `workspace/codeLens/refresh`
+//!   when the client supports it.
 //! - **Positions are source-aware**: engine `NodePosition` columns are UTF-8 byte offsets.
 //!   The server reads the ref baseline ONCE, diffs exactly that old buffer against the live
 //!   buffer, and maps ranges through the core's source-aware helpers with those same two
@@ -150,6 +155,12 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// One open document: full text (full sync) and the client's document version.
+struct Doc {
+    text: String,
+    version: Option<i64>,
+}
+
 struct ServerState {
     root: Option<PathBuf>,
     git_ref: String,
@@ -161,8 +172,8 @@ struct ServerState {
     /// uri → code lenses mapped from the last served SemanticDiff (the codeLens pull
     /// cache), already converted with the exact old/new buffers of that revision.
     lens_cache: HashMap<String, Vec<Value>>,
-    /// uri → latest known buffer content (didOpen/didChange).
-    content_cache: HashMap<String, String>,
+    /// uri → latest known buffer (didOpen/didChange), with its LSP document version.
+    content_cache: HashMap<String, Doc>,
     /// id source for server→client requests (codeLens refresh).
     next_server_id: i64,
     /// `shutdown` was received: every later request except `exit` is InvalidRequest.
@@ -298,6 +309,23 @@ fn into_array(value: Value) -> Result<Vec<Value>, String> {
     }
 }
 
+impl ServerState {
+    fn new(git_ref: String, wasm_dir: String) -> Self {
+        Self {
+            root: None,
+            git_ref,
+            config_json: "{}".to_owned(),
+            wasm_dir,
+            supports_codelens_refresh: false,
+            position_encoding: PositionEncoding::Utf16,
+            lens_cache: HashMap::new(),
+            content_cache: HashMap::new(),
+            next_server_id: 1,
+            shutdown_requested: false,
+        }
+    }
+}
+
 fn write_msg(out: &mut impl Write, msg: &Value) {
     let _ = out.write_all(&encode_message(msg));
     let _ = out.flush();
@@ -319,18 +347,7 @@ fn main() {
     let git_ref = arg_value(&args, "--ref").unwrap_or_else(|| "HEAD".to_owned());
     let wasm_dir = resolve_wasm_dir(&args);
 
-    let mut state = ServerState {
-        root: None,
-        git_ref,
-        config_json: "{}".to_owned(),
-        wasm_dir,
-        supports_codelens_refresh: false,
-        position_encoding: PositionEncoding::Utf16,
-        lens_cache: HashMap::new(),
-        content_cache: HashMap::new(),
-        next_server_id: 1,
-        shutdown_requested: false,
-    };
+    let mut state = ServerState::new(git_ref, wasm_dir);
 
     // Reader thread: bytes → frames → channel. Exits on EOF/fatal framing; dropping the
     // sender ends the main loop (#73: one thread, joined, nothing orphaned). A blocking
@@ -440,8 +457,12 @@ fn main() {
                 "textDocument/didOpen" => {
                     let uri = params.pointer("/textDocument/uri").and_then(Value::as_str);
                     let text = params.pointer("/textDocument/text").and_then(Value::as_str);
+                    let version = params.pointer("/textDocument/version").and_then(Value::as_i64);
                     if let (Some(uri), Some(text)) = (uri, text) {
-                        state.content_cache.insert(uri.to_owned(), text.to_owned());
+                        // (Re)open starts a fresh version history for the URI.
+                        state
+                            .content_cache
+                            .insert(uri.to_owned(), Doc { text: text.to_owned(), version });
                         if !dirty.iter().any(|u| u == uri) {
                             dirty.push(uri.to_owned());
                         }
@@ -456,18 +477,22 @@ fn main() {
                         .and_then(|c| c.last())
                         .and_then(|c| c.get("text"))
                         .and_then(Value::as_str);
+                    let version = params.pointer("/textDocument/version").and_then(Value::as_i64);
                     if let (Some(uri), Some(text)) = (uri, text) {
-                        state.content_cache.insert(uri.to_owned(), text.to_owned());
-                        if !dirty.iter().any(|u| u == uri) {
+                        if accept_change(&mut state, uri, text, version) && !dirty.iter().any(|u| u == uri) {
                             dirty.push(uri.to_owned());
                         }
                     }
                 }
                 "textDocument/didClose" => {
                     if let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) {
-                        state.lens_cache.remove(uri);
                         state.content_cache.remove(uri);
                         dirty.retain(|u| u != uri);
+                        let had_lenses = state.lens_cache.remove(uri).is_some();
+                        publish_diagnostics(&mut out, uri, None, &[]);
+                        if had_lenses {
+                            request_codelens_refresh(&mut state, &mut out);
+                        }
                     }
                 }
                 "textDocument/codeLens" => {
@@ -524,33 +549,84 @@ fn main() {
     let _ = reader.join();
 }
 
-/// `_compute_and_push`: diff the live buffer against the ref, map diagnostics + lenses
-/// with that revision's exact old/new buffers, cache the lenses for codeLens, publish
-/// diagnostics, and nudge the client's lens refresh when supported. Engine fallbacks,
-/// mapping failures and out-of-root files publish nothing (the pygls `diff is None` path).
-fn compute_and_push(state: &mut ServerState, out: &mut impl Write, uri: &str) {
-    let Some(root) = state.root.clone() else { return };
-    let Some(content) = state.content_cache.get(uri).cloned() else { return };
-    let Ok(file_path) = uri_to_path(uri, Some(&root)) else { return };
-    let Ok(rel) = file_path.strip_prefix(&root) else { return };
-    let rel = rel.to_string_lossy().replace('\\', "/");
-    let Ok((parsed, old_source)) = diff_live_buffer(state, &root, &rel, &content) else {
-        return;
-    };
-    let Some(diff) = parsed.get("diff") else { return };
-    let encoding = state.position_encoding;
-    let Ok(diagnostics) = diagnostics_for(diff, &content, encoding) else { return };
-    let Ok(lenses) = lenses_for(diff, &old_source, &content, encoding) else { return };
+/// Apply a full-sync `didChange` unless it is stale: a change whose version is not newer
+/// than the buffer's (late / out-of-order delivery) is dropped. Returns whether the buffer
+/// changed. A change for a URI that was never opened is accepted as its first revision.
+fn accept_change(state: &mut ServerState, uri: &str, text: &str, version: Option<i64>) -> bool {
+    if let Some(doc) = state.content_cache.get(uri) {
+        if let (Some(current), Some(incoming)) = (doc.version, version) {
+            if incoming <= current {
+                return false;
+            }
+        }
+    }
+    state
+        .content_cache
+        .insert(uri.to_owned(), Doc { text: text.to_owned(), version });
+    true
+}
 
-    state.lens_cache.insert(uri.to_owned(), lenses);
+/// What one compute produced for a document revision.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    /// Nothing is ever published for this URI (no workspace root / outside it).
+    NotServed,
+    /// A semantic diff, already mapped for the negotiated encoding.
+    Diff { diagnostics: Vec<Value>, lenses: Vec<Value> },
+    /// The engine declined this revision (`{"fallback": reason}`).
+    Declined(String),
+    /// The compute or the mapping failed.
+    Failed(String),
+}
+
+/// `_compute_and_push` (compute half): diff the live buffer against the ref and map
+/// diagnostics + lenses with that revision's exact old/new buffers.
+fn compute_outcome(state: &ServerState, uri: &str, content: &str) -> Outcome {
+    let Some(root) = state.root.clone() else { return Outcome::NotServed };
+    let Ok(file_path) = uri_to_path(uri, Some(&root)) else { return Outcome::NotServed };
+    let Ok(rel) = file_path.strip_prefix(&root) else { return Outcome::NotServed };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    let (parsed, old_source) = match diff_live_buffer(state, &root, &rel, content) {
+        Ok(ok) => ok,
+        Err(e) => return Outcome::Failed(e),
+    };
+    let Some(diff) = parsed.get("diff") else {
+        return match parsed.get("fallback").and_then(Value::as_str) {
+            Some(reason) => Outcome::Declined(reason.to_owned()),
+            None => Outcome::Failed("engine returned neither a diff nor a fallback".to_owned()),
+        };
+    };
+    let encoding = state.position_encoding;
+    let mapped = diagnostics_for(diff, content, encoding)
+        .and_then(|d| lenses_for(diff, &old_source, content, encoding).map(|l| (d, l)));
+    match mapped {
+        Ok((diagnostics, lenses)) => Outcome::Diff { diagnostics, lenses },
+        Err(e) => Outcome::Failed(format!("position mapping failed: {e}")),
+    }
+}
+
+/// The Information diagnostic that keeps a failed compute's provenance visible.
+fn failure_diagnostic(reason: &str) -> Value {
+    json!({
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+        "severity": 3,
+        "message": format!("Semantic diff unavailable for this revision: {reason}"),
+        "source": "intentumdiff",
+    })
+}
+
+fn publish_diagnostics(out: &mut impl Write, uri: &str, version: Option<i64>, diagnostics: &[Value]) {
+    let mut params = json!({"uri": uri, "diagnostics": diagnostics});
+    if let Some(version) = version {
+        params["version"] = json!(version);
+    }
     write_msg(
         out,
-        &json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/publishDiagnostics",
-            "params": {"uri": uri, "diagnostics": diagnostics},
-        }),
+        &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
     );
+}
+
+fn request_codelens_refresh(state: &mut ServerState, out: &mut impl Write) {
     if state.supports_codelens_refresh {
         let id = state.next_server_id;
         state.next_server_id += 1;
@@ -559,6 +635,44 @@ fn compute_and_push(state: &mut ServerState, out: &mut impl Write, uri: &str) {
             &json!({"jsonrpc": "2.0", "id": id, "method": "workspace/codeLens/refresh",
                     "params": Value::Null}),
         );
+    }
+}
+
+/// `_compute_and_push`: compute the buffer's current revision, then replace EVERYTHING
+/// previously published for the URI with that revision's results — cache lenses for the
+/// codeLens pull, publish versioned diagnostics, and nudge the client's lens refresh.
+fn compute_and_push(state: &mut ServerState, out: &mut impl Write, uri: &str) {
+    let Some(doc) = state.content_cache.get(uri) else { return };
+    let (content, version) = (doc.text.clone(), doc.version);
+    let outcome = compute_outcome(state, uri, &content);
+    apply_outcome(state, out, uri, version, outcome);
+}
+
+fn apply_outcome(
+    state: &mut ServerState,
+    out: &mut impl Write,
+    uri: &str,
+    version: Option<i64>,
+    outcome: Outcome,
+) {
+    match outcome {
+        Outcome::NotServed => {}
+        Outcome::Diff { diagnostics, lenses } => {
+            state.lens_cache.insert(uri.to_owned(), lenses);
+            publish_diagnostics(out, uri, version, &diagnostics);
+            request_codelens_refresh(state, out);
+        }
+        Outcome::Declined(_) | Outcome::Failed(_) => {
+            let had_lenses = state.lens_cache.remove(uri).is_some();
+            let diagnostics = match &outcome {
+                Outcome::Failed(reason) => vec![failure_diagnostic(reason)],
+                _ => Vec::new(),
+            };
+            publish_diagnostics(out, uri, version, &diagnostics);
+            if had_lenses {
+                request_codelens_refresh(state, out);
+            }
+        }
     }
 }
 
@@ -578,7 +692,7 @@ fn semantic_diff_request(state: &mut ServerState, params: &Value) -> Value {
         if old_uri == new_uri {
             let file_path = uri_to_path(new_uri, Some(&root))?;
             let content = match state.content_cache.get(new_uri) {
-                Some(text) => text.clone(),
+                Some(doc) => doc.text.clone(),
                 None => std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?,
             };
             let rel = file_path
@@ -735,6 +849,68 @@ mod tests {
         );
         assert_eq!(PositionEncoding::Utf8.as_str(), "utf-8");
         assert_eq!(PositionEncoding::Utf16.as_str(), "utf-16");
+    }
+
+    /// Decode every frame the server wrote into `out`.
+    fn frames(out: &[u8]) -> Vec<Value> {
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(out);
+        let mut msgs = Vec::new();
+        while let Ok(Some(DecodeEvent::Frame(msg))) = decoder.next_event() {
+            msgs.push(msg);
+        }
+        msgs
+    }
+
+    #[test]
+    fn stale_and_out_of_order_changes_are_dropped() {
+        let mut state = ServerState::new("HEAD".into(), String::new());
+        assert!(accept_change(&mut state, "u", "v1", Some(1)));
+        assert!(accept_change(&mut state, "u", "v3", Some(3)));
+        assert!(!accept_change(&mut state, "u", "v2", Some(2)), "late v2 must be dropped");
+        assert!(!accept_change(&mut state, "u", "v3-dup", Some(3)), "replayed v3 must be dropped");
+        assert_eq!(state.content_cache["u"].text, "v3");
+        assert_eq!(state.content_cache["u"].version, Some(3));
+        // Unversioned changes cannot be ordered, so they apply.
+        assert!(accept_change(&mut state, "u", "nv", None));
+    }
+
+    #[test]
+    fn declined_and_failed_revisions_replace_previous_results() {
+        let mut state = ServerState::new("HEAD".into(), String::new());
+        state.supports_codelens_refresh = true;
+        let lens = json!({"range": {}, "command": {"title": "t", "command": ""}});
+        let mut out = Vec::new();
+        apply_outcome(&mut state, &mut out, "u", Some(1),
+                      Outcome::Diff { diagnostics: vec![json!({"x": 1})], lenses: vec![lens] });
+        let msgs = frames(&out);
+        assert_eq!(msgs[0]["params"]["version"], 1);
+        assert_eq!(msgs[0]["params"]["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(msgs[1]["method"], "workspace/codeLens/refresh");
+        assert_eq!(state.lens_cache["u"].len(), 1);
+
+        // Declined: empty diagnostics for v2, lenses dropped, refresh requested.
+        let mut out = Vec::new();
+        apply_outcome(&mut state, &mut out, "u", Some(2), Outcome::Declined("no parser".into()));
+        let msgs = frames(&out);
+        assert_eq!(msgs[0]["params"], json!({"uri": "u", "version": 2, "diagnostics": []}));
+        assert_eq!(msgs[1]["method"], "workspace/codeLens/refresh");
+        assert!(!state.lens_cache.contains_key("u"));
+
+        // Failed: one Information diagnostic carrying the reason, never an empty "clean" set.
+        let mut out = Vec::new();
+        apply_outcome(&mut state, &mut out, "u", Some(3), Outcome::Failed("bad ref".into()));
+        let msgs = frames(&out);
+        assert_eq!(msgs.len(), 1, "no lenses left to refresh");
+        let diags = msgs[0]["params"]["diagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["severity"], 3);
+        assert!(diags[0]["message"].as_str().unwrap().contains("bad ref"));
+
+        // NotServed publishes nothing.
+        let mut out = Vec::new();
+        apply_outcome(&mut state, &mut out, "u", Some(4), Outcome::NotServed);
+        assert!(out.is_empty());
     }
 
     #[test]

@@ -26,8 +26,8 @@ Standard LSP 3.17 over stdio, plus one custom method:
 | Message | Behaviour |
 |---|---|
 | `initialize` | Advertises `textDocumentSync: Full` + a `codeLensProvider` + the negotiated `positionEncoding` (`utf-8` when the client offers it in `general.positionEncodings`, else `utf-16`); loads the repo's `intentumdiff.yaml` config from `rootUri`; reads the client's `codeLens/refreshSupport`. |
-| `textDocument/didOpen` / `didChange` | Updates the buffer and computes a diff against the ref, then **pushes** `publishDiagnostics` and (when supported) requests `workspace/codeLens/refresh`. |
-| `textDocument/didClose` | Drops the cached diff and buffer. |
+| `textDocument/didOpen` / `didChange` | Updates the buffer (a `didChange` whose version is not newer than the buffer's is dropped) and computes a diff against the ref, then **pushes** versioned `publishDiagnostics` and (when supported) requests `workspace/codeLens/refresh`. A declined revision publishes empty diagnostics and drops its lenses; a failed one publishes a single Information diagnostic naming the reason and drops its lenses. |
+| `textDocument/didClose` | Drops the buffer and lenses and publishes empty diagnostics (lens refresh when lenses were dropped). |
 | `textDocument/codeLens` | Returns refactoring-family lenses mapped from the last computed diff (pull, from cache). |
 | `intentumdiff/semanticDiff` | `oldUri == newUri`: the live buffer (or on-disk file) vs the ref. Distinct URIs: a workspace-contained two-file compare. Errors are in-band `{"error": …}`. |
 | `shutdown` / `exit` | `shutdown` → `null`; later requests get `-32600`. `exit` terminates the process at once — code 0 after `shutdown`, 1 without — even while stdin stays open; EOF also exits cleanly (#73). |
@@ -50,7 +50,8 @@ misplaced.
   keystroke burst costs one diff. No async runtime, one joined thread.
 - **`uri_to_path` ports the #88 guards:** file scheme only, percent-decode, explicit `..`
   rejection, the Windows drive-letter fix, and workspace containment.
-- Engine fallbacks publish nothing for that revision (the pygls `diff is None` behaviour).
+- Engine fallbacks publish empty diagnostics for that revision (clearing the previous
+  revision's results) instead of leaving stale ones in place.
 
 **Parser wasm dir resolution:** `--wasm-dir` flag → `INTENTUMDIFF_WASM_DIR` env →
 `<exe dir>/wasm` → dev-layout ancestor walk for `src/intentumdiff/wasm`; every candidate is
