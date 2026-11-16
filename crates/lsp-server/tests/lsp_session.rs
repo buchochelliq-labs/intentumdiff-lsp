@@ -589,3 +589,104 @@ fn out_of_order_changes_cannot_overwrite_a_newer_revision() {
     assert!(types.contains(&"REFACTORING"), "got {types:?}");
     finish(s, &base);
 }
+
+fn spawn_bare_with(extra: &[&str]) -> Session {
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
+    let dir = std::env::temp_dir();
+    let mut child = Command::new(bin)
+        .args(["--wasm-dir", &dir.join("no-such-wasm-dir").to_string_lossy()])
+        .args(extra)
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn lsp-server");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut decoder = FrameDecoder::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            decoder.feed(&buf[..n]);
+            while let Ok(Some(DecodeEvent::Frame(msg))) = decoder.next_event() {
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    Session { child, stdin, rx, seen_notifications: Vec::new() }
+}
+
+#[test]
+fn document_ceiling_evicts_the_oldest_buffer_and_clears_it() {
+    let mut s = spawn_bare_with(&["--max-open-documents", "2"]);
+    initialize_bare(&mut s);
+    for name in ["a", "b", "c"] {
+        s.open(&format!("file:///lim/{name}.ts"), 1, "const x = 1;\n");
+    }
+    // No workspace root → nothing is computed; the only publish is the eviction of `a`.
+    let cleared = s.recv_publish("file:///lim/a.ts");
+    assert_eq!(cleared["diagnostics"], json!([]));
+    finish_bare(s);
+}
+
+#[test]
+fn bursts_stay_bounded_and_every_request_is_answered() {
+    // A tiny queue forces back-pressure on every write; requests interleaved with
+    // 10 KiB full-sync revisions must all be answered, in order.
+    let mut s = spawn_bare_with(&["--max-pending-messages", "4", "--max-pending-bytes", "16384"]);
+    initialize_bare(&mut s);
+    let text = "x".repeat(10 * 1024);
+    s.open("file:///burst/a.ts", 1, &text);
+    let mut writer = s.stdin;
+    let frames: Vec<Vec<u8>> = (2..402)
+        .flat_map(|v| {
+            let mut out = vec![encode_message(&json!({
+                "jsonrpc": "2.0", "method": "textDocument/didChange",
+                "params": {"textDocument": {"uri": "file:///burst/a.ts", "version": v},
+                           "contentChanges": [{"text": format!("{text}{v}")}]}}))];
+            if v % 8 == 0 {
+                out.push(encode_message(&json!({
+                    "jsonrpc": "2.0", "id": 1000 + v, "method": "textDocument/codeLens",
+                    "params": {"textDocument": {"uri": "file:///burst/a.ts"}}})));
+            }
+            out
+        })
+        .collect();
+    let feeder = std::thread::spawn(move || {
+        for f in frames {
+            writer.write_all(&f).expect("write");
+        }
+        writer.flush().expect("flush");
+        writer
+    });
+    let mut answered = Vec::new();
+    while answered.len() < 50 {
+        // `s.stdin` is lent to the feeder; read the frame channel directly.
+        let msg = s.rx.recv_timeout(Duration::from_secs(120)).expect("timed out waiting for a frame");
+        if let Some(id) = msg.get("id").and_then(Value::as_i64) {
+            assert!(msg["result"].is_array(), "got {msg}");
+            answered.push(id);
+        }
+    }
+    let expected: Vec<i64> = (2..402).filter(|v| v % 8 == 0).map(|v| 1000 + v).collect();
+    assert_eq!(answered, expected);
+    s.stdin = feeder.join().unwrap();
+    finish_bare(s);
+}
+
+fn finish_bare(mut s: Session) {
+    s.send(&json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": Value::Null}));
+    s.recv_response(99);
+    s.send(&json!({"jsonrpc": "2.0", "method": "exit", "params": Value::Null}));
+    let status = wait_with_deadline(&mut s.child, EXIT_DEADLINE).expect("exit");
+    assert!(status.success());
+}

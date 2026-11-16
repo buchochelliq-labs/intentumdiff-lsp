@@ -21,6 +21,16 @@
 //!   says why (never relabelled as a clean diff) and drops its lenses; `didClose` publishes
 //!   empty diagnostics and drops lenses. Lens drops trigger `workspace/codeLens/refresh`
 //!   when the client supports it.
+//! - **Bounded memory** (see [`Limits`]): the reader→main queue holds at most
+//!   `max_pending_messages` frames / `max_pending_bytes` of estimated payload (one frame
+//!   larger than that is still admitted alone). A full queue blocks the reader — the
+//!   client's writes back-pressure through the pipe; nothing is dropped. Before blocking, a
+//!   queued full-sync `didChange` is replaced in place by a newer one for the same URI when
+//!   no request or other message for that URI follows it (obsolete revisions are coalesced
+//!   before they accumulate). Open buffers are capped at `max_open_documents` /
+//!   `max_document_bytes`; beyond that the least-recently-updated documents are evicted —
+//!   their diagnostics are cleared and lenses dropped — and come back on their next
+//!   full-sync change or re-open.
 //! - **Positions are source-aware**: engine `NodePosition` columns are UTF-8 byte offsets.
 //!   The server reads the ref baseline ONCE, diffs exactly that old buffer against the live
 //!   buffer, and maps ranges through the core's source-aware helpers with those same two
@@ -28,10 +38,10 @@
 //!   when the client offers it (byte columns are then already exact), otherwise the
 //!   protocol default `utf-16`. No conversion algorithm lives in this binary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use intentumdiff_lsp_client::{encode_message, DecodeEvent, FrameDecoder};
 use intentumdiff_rust_core::c_abi;
@@ -155,10 +165,191 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Process-wide memory ceilings. Defaults suit an editor session; each is overridable on
+/// the command line (`--max-pending-messages`, `--max-pending-bytes`,
+/// `--max-open-documents`, `--max-document-bytes`).
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    max_pending_messages: usize,
+    max_pending_bytes: usize,
+    max_open_documents: usize,
+    max_document_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_pending_messages: 1_024,
+            max_pending_bytes: 64 * 1024 * 1024,
+            max_open_documents: 1_024,
+            max_document_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+impl Limits {
+    fn from_args(args: &[String]) -> Self {
+        let mut limits = Self::default();
+        let set = |flag: &str, slot: &mut usize| {
+            if let Some(v) = arg_value(args, flag).and_then(|v| v.parse::<usize>().ok()) {
+                *slot = v.max(1);
+            }
+        };
+        set("--max-pending-messages", &mut limits.max_pending_messages);
+        set("--max-pending-bytes", &mut limits.max_pending_bytes);
+        set("--max-open-documents", &mut limits.max_open_documents);
+        set("--max-document-bytes", &mut limits.max_document_bytes);
+        limits
+    }
+}
+
+/// Estimated retained size of a queued frame: the document text dominates for
+/// didOpen/didChange, so count it directly (plus envelope slack) instead of re-serialising.
+fn estimate_size(msg: &Value) -> usize {
+    const ENVELOPE: usize = 256;
+    let text = msg
+        .pointer("/params/textDocument/text")
+        .and_then(Value::as_str)
+        .map(str::len)
+        .or_else(|| {
+            msg.pointer("/params/contentChanges")
+                .and_then(Value::as_array)
+                .map(|c| c.iter().filter_map(|c| c.get("text")?.as_str()).map(str::len).sum())
+        });
+    match text {
+        Some(len) => len + ENVELOPE,
+        None => msg.to_string().len(),
+    }
+}
+
+fn method_of(msg: &Value) -> &str {
+    msg.get("method").and_then(Value::as_str).unwrap_or("")
+}
+
+fn uri_of(msg: &Value) -> Option<&str> {
+    msg.pointer("/params/textDocument/uri").and_then(Value::as_str)
+}
+
+#[derive(Default)]
+struct QueueState {
+    items: VecDeque<(Value, usize)>,
+    bytes: usize,
+    closed: bool,
+}
+
+/// The bounded reader→main queue (replaces an unbounded mpsc channel).
+struct PendingQueue {
+    state: Mutex<QueueState>,
+    not_empty: Condvar,
+    not_full: Condvar,
+    limits: Limits,
+}
+
+impl PendingQueue {
+    fn new(limits: Limits) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(QueueState::default()),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+            limits,
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Try to fold a full-sync `didChange` into a queued one for the same URI. Returns
+    /// `None` when it was absorbed (replaced the queued revision, or was itself older and
+    /// would be ignored anyway), else gives the message back.
+    fn coalesce(q: &mut QueueState, msg: Value, size: usize) -> Option<(Value, usize)> {
+        if method_of(&msg) != "textDocument/didChange" {
+            return Some((msg, size));
+        }
+        let Some(uri) = uri_of(&msg).map(str::to_owned) else { return Some((msg, size)) };
+        // Walk back from the tail: anything that is a request, or touches this URI and is
+        // not a didChange, pins the order — stop.
+        for i in (0..q.items.len()).rev() {
+            let queued = &q.items[i].0;
+            let touches = uri_of(queued) == Some(uri.as_str());
+            if touches && method_of(queued) == "textDocument/didChange" {
+                let version = |m: &Value| m.pointer("/params/textDocument/version").and_then(Value::as_i64);
+                return match (version(queued), version(&msg)) {
+                    (Some(old), Some(new)) if new <= old => None, // stale: main would drop it
+                    _ => {
+                        let old_size = q.items[i].1;
+                        q.items[i] = (msg, size);
+                        q.bytes = q.bytes - old_size + size;
+                        None
+                    }
+                };
+            }
+            if touches || queued.get("id").is_some() {
+                break;
+            }
+        }
+        Some((msg, size))
+    }
+
+    /// Enqueue, blocking while the queue is full (back-pressure). Never drops a message
+    /// except an obsolete full-sync revision superseded per [`Self::coalesce`].
+    fn push(&self, msg: Value) {
+        let size = estimate_size(&msg);
+        let mut q = self.lock();
+        let Some((mut msg, size)) = Self::coalesce(&mut q, msg, size) else {
+            self.not_empty.notify_one();
+            return;
+        };
+        loop {
+            let full = q.items.len() >= self.limits.max_pending_messages
+                || q.bytes + size > self.limits.max_pending_bytes;
+            if q.items.is_empty() || !full {
+                break;
+            }
+            q = self.not_full.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The queue changed while waiting: the revision may now coalesce after all.
+            match Self::coalesce(&mut q, msg, size) {
+                None => {
+                    self.not_empty.notify_one();
+                    return;
+                }
+                Some((back, _)) => msg = back,
+            }
+        }
+        q.bytes += size;
+        q.items.push_back((msg, size));
+        self.not_empty.notify_one();
+    }
+
+    /// The reader is gone (EOF / fatal framing).
+    fn close(&self) {
+        self.lock().closed = true;
+        self.not_empty.notify_all();
+    }
+
+    /// Block until frames are queued, then take ALL of them (one coalescing batch).
+    /// `None` once the reader closed and the queue is drained.
+    fn recv_batch(&self) -> Option<Vec<Value>> {
+        let mut q = self.lock();
+        while q.items.is_empty() {
+            if q.closed {
+                return None;
+            }
+            q = self.not_empty.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        let batch: Vec<Value> = q.items.drain(..).map(|(m, _)| m).collect();
+        q.bytes = 0;
+        self.not_full.notify_all();
+        Some(batch)
+    }
+}
+
 /// One open document: full text (full sync) and the client's document version.
 struct Doc {
     text: String,
     version: Option<i64>,
+    /// Monotonic "last updated" stamp for LRU eviction.
+    touched: u64,
 }
 
 struct ServerState {
@@ -178,6 +369,11 @@ struct ServerState {
     next_server_id: i64,
     /// `shutdown` was received: every later request except `exit` is InvalidRequest.
     shutdown_requested: bool,
+    limits: Limits,
+    /// Sum of `content_cache` text lengths.
+    cached_bytes: usize,
+    /// Source of `Doc::touched` stamps.
+    clock: u64,
 }
 
 /// LSP `PositionEncodingKind` this server can emit.
@@ -322,8 +518,67 @@ impl ServerState {
             content_cache: HashMap::new(),
             next_server_id: 1,
             shutdown_requested: false,
+            limits: Limits::default(),
+            cached_bytes: 0,
+            clock: 0,
         }
     }
+
+    /// Insert/replace a buffer, keeping `cached_bytes` exact.
+    fn store_doc(&mut self, uri: &str, text: &str, version: Option<i64>) {
+        self.clock += 1;
+        let doc = Doc { text: text.to_owned(), version, touched: self.clock };
+        self.cached_bytes += doc.text.len();
+        if let Some(old) = self.content_cache.insert(uri.to_owned(), doc) {
+            self.cached_bytes -= old.text.len();
+        }
+    }
+
+    fn remove_doc(&mut self, uri: &str) {
+        if let Some(old) = self.content_cache.remove(uri) {
+            self.cached_bytes -= old.text.len();
+        }
+    }
+
+    /// Evict least-recently-updated documents (never `keep`) until the open-document and
+    /// cached-byte ceilings hold. Returns the evicted URIs.
+    fn evict_over_limits(&mut self, keep: &str) -> Vec<String> {
+        let mut evicted = Vec::new();
+        while self.content_cache.len() > self.limits.max_open_documents
+            || self.cached_bytes > self.limits.max_document_bytes
+        {
+            let victim = self
+                .content_cache
+                .iter()
+                .filter(|(uri, _)| uri.as_str() != keep)
+                .min_by_key(|(_, doc)| doc.touched)
+                .map(|(uri, _)| uri.clone());
+            let Some(victim) = victim else { break }; // only `keep` is left
+            self.remove_doc(&victim);
+            self.lens_cache.remove(&victim);
+            evicted.push(victim);
+        }
+        evicted
+    }
+}
+
+/// Apply the document ceilings after `uri` was stored: evicted documents lose their
+/// diagnostics (empty publish) and lenses (refresh) and leave the dirty set.
+fn enforce_document_limits(
+    state: &mut ServerState,
+    out: &mut impl Write,
+    dirty: &mut Vec<String>,
+    uri: &str,
+) {
+    let evicted = state.evict_over_limits(uri);
+    if evicted.is_empty() {
+        return;
+    }
+    for victim in &evicted {
+        dirty.retain(|u| u != victim);
+        publish_diagnostics(out, victim, None, &[]);
+    }
+    request_codelens_refresh(state, out);
 }
 
 fn write_msg(out: &mut impl Write, msg: &Value) {
@@ -348,13 +603,24 @@ fn main() {
     let wasm_dir = resolve_wasm_dir(&args);
 
     let mut state = ServerState::new(git_ref, wasm_dir);
+    state.limits = Limits::from_args(&args);
 
     // Reader thread: bytes → frames → channel. Exits on EOF/fatal framing; dropping the
     // sender ends the main loop (#73: one thread, joined, nothing orphaned). A blocking
     // stdin read cannot be cancelled portably, so protocol `exit` does NOT join it: the
     // process terminates instead (see the end of `main`).
-    let (tx, rx) = mpsc::channel::<Value>();
+    let queue = PendingQueue::new(state.limits);
+    let reader_queue = Arc::clone(&queue);
     let reader = std::thread::spawn(move || {
+        let queue = reader_queue;
+        // Closing on every exit path wakes the main loop at EOF / fatal framing.
+        struct CloseOnDrop(Arc<PendingQueue>);
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let _close = CloseOnDrop(Arc::clone(&queue));
         let mut stdin = std::io::stdin().lock();
         let mut decoder = FrameDecoder::new();
         let mut chunk = [0u8; 8_192];
@@ -366,11 +632,7 @@ fn main() {
             decoder.feed(&chunk[..n]);
             loop {
                 match decoder.next_event() {
-                    Ok(Some(DecodeEvent::Frame(msg))) => {
-                        if tx.send(msg).is_err() {
-                            return;
-                        }
-                    }
+                    Ok(Some(DecodeEvent::Frame(msg))) => queue.push(msg),
                     Ok(Some(DecodeEvent::MalformedFrame)) => {}
                     Ok(None) => break,
                     Err(_) => return, // fatal framing violation → close
@@ -384,20 +646,18 @@ fn main() {
     // Set by protocol `exit`: 0 after `shutdown`, 1 without (LSP 3.17).
     let mut exit_code: Option<i32> = None;
 
-    'main: while let Ok(first) = rx.recv() {
-        // Debounce by coalescing: drain whatever is already buffered, then keep only the
+    'main: while let Some(batch) = queue.recv_batch() {
+        // Debounce by coalescing: take whatever is already buffered, then keep only the
         // LATEST content per URI. Everything else is handled in arrival order.
-        let mut batch = vec![first];
-        while let Ok(more) = rx.try_recv() {
-            batch.push(more);
-        }
         let mut dirty: Vec<String> = Vec::new();
-        for msg in &batch {
-            let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        for mut msg in batch {
+            let method = method_of(&msg).to_owned();
+            let method = method.as_str();
             if method.is_empty() {
                 continue; // a response to one of OUR requests (codeLens refresh) — ignore
             }
-            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            // Move (not clone) the params out: a full-sync text is the bulk of the frame.
+            let params = msg.get_mut("params").map(Value::take).unwrap_or(Value::Null);
             let id = msg.get("id");
             if state.shutdown_requested && method != "exit" {
                 if let Some(id) = id {
@@ -460,12 +720,11 @@ fn main() {
                     let version = params.pointer("/textDocument/version").and_then(Value::as_i64);
                     if let (Some(uri), Some(text)) = (uri, text) {
                         // (Re)open starts a fresh version history for the URI.
-                        state
-                            .content_cache
-                            .insert(uri.to_owned(), Doc { text: text.to_owned(), version });
+                        state.store_doc(uri, text, version);
                         if !dirty.iter().any(|u| u == uri) {
                             dirty.push(uri.to_owned());
                         }
+                        enforce_document_limits(&mut state, &mut out, &mut dirty, uri);
                     }
                 }
                 "textDocument/didChange" => {
@@ -479,14 +738,17 @@ fn main() {
                         .and_then(Value::as_str);
                     let version = params.pointer("/textDocument/version").and_then(Value::as_i64);
                     if let (Some(uri), Some(text)) = (uri, text) {
-                        if accept_change(&mut state, uri, text, version) && !dirty.iter().any(|u| u == uri) {
-                            dirty.push(uri.to_owned());
+                        if accept_change(&mut state, uri, text, version) {
+                            if !dirty.iter().any(|u| u == uri) {
+                                dirty.push(uri.to_owned());
+                            }
+                            enforce_document_limits(&mut state, &mut out, &mut dirty, uri);
                         }
                     }
                 }
                 "textDocument/didClose" => {
                     if let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) {
-                        state.content_cache.remove(uri);
+                        state.remove_doc(uri);
                         dirty.retain(|u| u != uri);
                         let had_lenses = state.lens_cache.remove(uri).is_some();
                         publish_diagnostics(&mut out, uri, None, &[]);
@@ -544,8 +806,7 @@ fn main() {
         std::process::exit(code);
     }
     // EOF / fatal framing: the reader has already returned (that is what closed the
-    // channel), so this join is immediate.
-    drop(rx);
+    // queue), so this join is immediate.
     let _ = reader.join();
 }
 
@@ -560,9 +821,7 @@ fn accept_change(state: &mut ServerState, uri: &str, text: &str, version: Option
             }
         }
     }
-    state
-        .content_cache
-        .insert(uri.to_owned(), Doc { text: text.to_owned(), version });
+    state.store_doc(uri, text, version);
     true
 }
 
@@ -911,6 +1170,136 @@ mod tests {
         let mut out = Vec::new();
         apply_outcome(&mut state, &mut out, "u", Some(4), Outcome::NotServed);
         assert!(out.is_empty());
+    }
+
+    fn change(uri: &str, version: i64, text: &str) -> Value {
+        json!({"jsonrpc": "2.0", "method": "textDocument/didChange",
+               "params": {"textDocument": {"uri": uri, "version": version},
+                          "contentChanges": [{"text": text}]}})
+    }
+
+    fn small_limits() -> Limits {
+        Limits { max_pending_messages: 2, max_pending_bytes: 4_096, ..Limits::default() }
+    }
+
+    #[test]
+    fn queue_coalesces_obsolete_full_sync_revisions_before_accumulating() {
+        let q = PendingQueue::new(Limits::default());
+        q.push(change("u", 1, "u1"));
+        q.push(change("v", 1, "v1"));
+        q.push(change("u", 2, "u2"));
+        q.push(change("u", 1, "late")); // older than the queued u2 → absorbed
+        let batch = q.recv_batch().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0]["params"]["contentChanges"][0]["text"], "u2");
+        assert_eq!(batch[1]["params"]["contentChanges"][0]["text"], "v1");
+        assert_eq!(q.lock().bytes, 0);
+    }
+
+    #[test]
+    fn queue_never_reorders_across_requests_or_other_messages_for_the_uri() {
+        let q = PendingQueue::new(Limits::default());
+        q.push(change("u", 1, "u1"));
+        q.push(json!({"jsonrpc": "2.0", "id": 7, "method": "intentumdiff/semanticDiff",
+                      "params": {"oldUri": "u", "newUri": "u"}}));
+        q.push(change("u", 2, "u2"));
+        q.push(json!({"jsonrpc": "2.0", "method": "textDocument/didClose",
+                      "params": {"textDocument": {"uri": "u"}}}));
+        q.push(change("u", 3, "u3"));
+        assert_eq!(q.recv_batch().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn full_queue_blocks_the_reader_without_dropping_requests() {
+        let q = PendingQueue::new(small_limits());
+        let producer = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || {
+                for id in 0..50 {
+                    q.push(json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/codeLens",
+                                  "params": {"textDocument": {"uri": "u"}}}));
+                }
+                q.close();
+            })
+        };
+        let mut ids = Vec::new();
+        while let Some(batch) = q.recv_batch() {
+            assert!(batch.len() <= 2, "queue exceeded its message ceiling: {}", batch.len());
+            ids.extend(batch.iter().map(|m| m["id"].as_i64().unwrap()));
+        }
+        producer.join().unwrap();
+        assert_eq!(ids, (0..50).collect::<Vec<_>>(), "every request must arrive, in order");
+    }
+
+    #[test]
+    fn byte_ceiling_applies_but_one_oversize_frame_is_admitted_alone() {
+        let q = PendingQueue::new(small_limits());
+        let big = "x".repeat(10_000);
+        q.push(change("a", 1, &big)); // empty queue: admitted despite the byte ceiling
+        let (tx, rx) = std::sync::mpsc::channel();
+        let producer = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || {
+                q.push(change("b", 1, "small"));
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(150)).is_err(),
+            "a push over the byte ceiling must block"
+        );
+        assert_eq!(q.recv_batch().unwrap().len(), 1);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("drain must unblock the reader");
+        producer.join().unwrap();
+        assert_eq!(q.recv_batch().unwrap().len(), 1);
+        q.close();
+        assert!(q.recv_batch().is_none());
+    }
+
+    #[test]
+    fn document_cache_evicts_least_recently_updated_and_clears_their_results() {
+        let mut state = ServerState::new("HEAD".into(), String::new());
+        state.limits = Limits { max_open_documents: 2, max_document_bytes: 10, ..Limits::default() };
+        state.supports_codelens_refresh = true;
+        let mut dirty = Vec::new();
+        let mut out = Vec::new();
+        for uri in ["a", "b"] {
+            state.store_doc(uri, "123", Some(1));
+            state.lens_cache.insert(uri.to_owned(), vec![]);
+            dirty.push(uri.to_owned());
+            enforce_document_limits(&mut state, &mut out, &mut dirty, uri);
+        }
+        assert!(out.is_empty());
+        assert!(accept_change(&mut state, "a", "1234", Some(2))); // a is now newest
+        state.store_doc("c", "1", Some(1));
+        dirty.push("c".to_owned());
+        enforce_document_limits(&mut state, &mut out, &mut dirty, "c");
+        let msgs = frames(&out);
+        assert_eq!(msgs[0]["params"], json!({"uri": "b", "diagnostics": []}));
+        assert_eq!(msgs[1]["method"], "workspace/codeLens/refresh");
+        assert!(!state.content_cache.contains_key("b") && !state.lens_cache.contains_key("b"));
+        assert_eq!(dirty, vec!["a".to_owned(), "c".to_owned()]);
+        assert_eq!(state.cached_bytes, 5);
+
+        // Byte ceiling: one big document pushes the others out but is itself kept.
+        let mut out = Vec::new();
+        state.store_doc("big", "0123456789abc", Some(1));
+        enforce_document_limits(&mut state, &mut out, &mut dirty, "big");
+        assert_eq!(state.content_cache.len(), 1);
+        assert_eq!(state.cached_bytes, 13);
+        // Close releases everything.
+        state.remove_doc("big");
+        assert_eq!(state.cached_bytes, 0);
+    }
+
+    #[test]
+    fn limits_parse_from_the_command_line() {
+        let args: Vec<String> = ["bin", "--max-open-documents", "3", "--max-pending-bytes", "0"]
+            .iter().map(|s| s.to_string()).collect();
+        let limits = Limits::from_args(&args);
+        assert_eq!(limits.max_open_documents, 3);
+        assert_eq!(limits.max_pending_bytes, 1, "zero is clamped to one");
+        assert_eq!(limits.max_pending_messages, Limits::default().max_pending_messages);
     }
 
     #[test]

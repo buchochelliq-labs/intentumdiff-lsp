@@ -48,6 +48,15 @@ misplaced.
 - **Debounce by coalescing, not timers.** One reader thread queues frames; before computing,
   the loop drains what is already buffered and keeps only the *latest* content per URI — a
   keystroke burst costs one diff. No async runtime, one joined thread.
+- **Bounded memory.** The reader→main queue holds at most 1024 frames / 64 MiB of estimated
+  payload (one larger frame is admitted alone; frames are capped at 64 MiB by the codec). A
+  full queue blocks the reader, so the client's writes back-pressure through the pipe —
+  requests are never dropped. A queued full-sync `didChange` is replaced in place by a newer
+  one for the same URI when no request or other message for that URI follows it. Open
+  buffers are capped at 1024 documents / 256 MiB of text: the least-recently-updated ones
+  are evicted (diagnostics cleared, lenses dropped) and return on their next change or
+  re-open. Override with `--max-pending-messages`, `--max-pending-bytes`,
+  `--max-open-documents`, `--max-document-bytes`.
 - **`uri_to_path` ports the #88 guards:** file scheme only, percent-decode, explicit `..`
   rejection, the Windows drive-letter fix, and workspace containment.
 - Engine fallbacks publish empty diagnostics for that revision (clearing the previous
