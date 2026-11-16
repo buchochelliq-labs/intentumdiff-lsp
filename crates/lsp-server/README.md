@@ -25,16 +25,21 @@ Standard LSP 3.17 over stdio, plus one custom method:
 
 | Message | Behaviour |
 |---|---|
-| `initialize` | Advertises `textDocumentSync: Full` + a `codeLensProvider`; loads the repo's `intentumdiff.yaml` config from `rootUri`; reads the client's `codeLens/refreshSupport`. |
+| `initialize` | Advertises `textDocumentSync: Full` + a `codeLensProvider` + the negotiated `positionEncoding` (`utf-8` when the client offers it in `general.positionEncodings`, else `utf-16`); loads the repo's `intentumdiff.yaml` config from `rootUri`; reads the client's `codeLens/refreshSupport`. |
 | `textDocument/didOpen` / `didChange` | Updates the buffer and computes a diff against the ref, then **pushes** `publishDiagnostics` and (when supported) requests `workspace/codeLens/refresh`. |
 | `textDocument/didClose` | Drops the cached diff and buffer. |
-| `textDocument/codeLens` | Returns refactoring-family lenses from the last computed diff (pull, from cache). |
+| `textDocument/codeLens` | Returns refactoring-family lenses mapped from the last computed diff (pull, from cache). |
 | `intentumdiff/semanticDiff` | `oldUri == newUri`: the live buffer (or on-disk file) vs the ref. Distinct URIs: a workspace-contained two-file compare. Errors are in-band `{"error": …}`. |
 | `shutdown` / `exit` | Clean exit, no orphaned threads (#73). |
 
-**Compute** is the engine's `live_handle_diff_impl` (config-aware, all-language, guardrails
-included) — identical to what the live-server binary serves. **Response shapes** are the
-core's `lsp_server_shapes` mappings, parity-locked against `lsprotocol`'s encoder.
+**Compute** is the engine's live-diff path (config-aware, all-language, guardrails included):
+the server reads the ref baseline once through the core's strict Git reader and diffs exactly
+that buffer against the live one with `live_diff_contents_impl` — the same resolution as
+`live_handle_diff_impl`. **Response shapes** are the core's source-aware
+`lsp_server_shapes` mappings, fed the same old/new buffers the engine positioned: engine
+columns are UTF-8 byte offsets, converted to UTF-16 code units by the core (or passed through
+when `utf-8` was negotiated). Spans that do not fit their buffer are refused, never
+misplaced.
 
 ## First-cut scope (deliberate)
 

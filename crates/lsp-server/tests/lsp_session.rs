@@ -14,9 +14,16 @@ use std::time::Duration;
 use intentumdiff_lsp_client::{encode_message, DecodeEvent, FrameDecoder};
 use serde_json::{json, Value};
 
-/// The dev-layout wasm dir (walk the crate's ancestors for `src/intentumdiff/wasm`), verified
-/// by `parser_manifest.json`. `None` when the parsers have not been built.
+/// The parser bundle: `INTENTUMDIFF_TEST_WASM_DIR` when set, else the dev-layout wasm dir
+/// (walk the crate's ancestors for `src/intentumdiff/wasm`), verified by
+/// `parser_manifest.json`. `None` when the parsers have not been built.
 fn find_wasm_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("INTENTUMDIFF_TEST_WASM_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.join("parser_manifest.json").is_file() {
+            return Some(dir);
+        }
+    }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     for ancestor in manifest.ancestors() {
         let dev = ancestor.join("src").join("intentumdiff").join("wasm");
@@ -259,5 +266,94 @@ fn native_lsp_server_serves_the_full_editor_flow() {
     let status = s.child.wait().expect("wait");
     assert!(status.success(), "clean exit expected, got {status:?}");
 
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A git fixture repo with one committed file; returns (temp base, repo).
+fn fixture_repo(files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+    let base = unique_temp_dir();
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "T"]);
+    for (name, text) in files {
+        std::fs::write(repo.join(name), text).unwrap();
+        git(&repo, &["add", name]);
+    }
+    git(&repo, &["commit", "-m", "v1"]);
+    (base, repo)
+}
+
+/// Open `uri` with `text`, wait for the diagnostics push, then pull its code lenses.
+fn lenses_after_open(s: &mut Session, uri: &str, text: &str, request_id: i64) -> Vec<Value> {
+    s.send(&json!({
+        "jsonrpc": "2.0", "method": "textDocument/didOpen",
+        "params": {"textDocument": {"uri": uri, "languageId": "typescript", "version": 1, "text": text}},
+    }));
+    let diag = s.recv();
+    assert_eq!(diag["method"], "textDocument/publishDiagnostics");
+    s.send(&json!({
+        "jsonrpc": "2.0", "id": request_id, "method": "textDocument/codeLens",
+        "params": {"textDocument": {"uri": uri}},
+    }));
+    s.recv_response(request_id)["result"].as_array().cloned().unwrap_or_default()
+}
+
+#[test]
+fn native_code_lenses_use_the_negotiated_position_encoding() {
+    // ECO-04: engine columns are UTF-8 bytes. `/* ééé */ ` is 13 bytes but 10 UTF-16 units,
+    // so the rename lens over `function …` must start at character 10 under the default
+    // encoding, and stay at the byte column 13 when the client negotiated utf-8.
+    let Some(wasm_dir) = find_wasm_dir() else {
+        eprintln!("skipping: bundled wasm parsers not built (no parser_manifest.json)");
+        return;
+    };
+    if !git_available() {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
+    let old = "/* ééé */ function foo(a: number) { return a; }\n";
+    let new = "/* ééé */ function bar(a: number) { return a; }\n";
+    let (base, repo) = fixture_repo(&[("u.ts", old)]);
+    let uri = file_uri(&repo.join("u.ts"));
+
+    for (offered, want_encoding, want_start, want_end) in [
+        (json!(null), "utf-16", 10, 47),
+        (json!(["utf-16"]), "utf-16", 10, 47),
+        (json!(["utf-8", "utf-16"]), "utf-8", 13, 50),
+    ] {
+        let mut s = spawn(bin, &repo, &wasm_dir);
+        let mut caps = json!({});
+        if !offered.is_null() {
+            caps["general"] = json!({"positionEncodings": offered});
+        }
+        s.send(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"rootUri": file_uri(&repo), "capabilities": caps},
+        }));
+        let init = s.recv_response(1);
+        assert_eq!(init["result"]["capabilities"]["positionEncoding"], want_encoding);
+        s.send(&json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+        let lenses = lenses_after_open(&mut s, &uri, new, 2);
+        let rename = lenses
+            .iter()
+            .find(|l| l["command"]["title"].as_str().unwrap_or("").contains("RENAME"))
+            .unwrap_or_else(|| panic!("expected a rename lens, got {lenses:?}"));
+        assert_eq!(
+            rename["range"],
+            json!({"start": {"line": 0, "character": want_start},
+                   "end": {"line": 0, "character": want_end}}),
+            "offered {offered}"
+        );
+
+        s.send(&json!({"jsonrpc": "2.0", "id": 9, "method": "shutdown", "params": Value::Null}));
+        s.recv_response(9);
+        s.send(&json!({"jsonrpc": "2.0", "method": "exit", "params": Value::Null}));
+        drop(s.stdin);
+        assert!(s.child.wait().expect("wait").success());
+    }
     let _ = std::fs::remove_dir_all(&base);
 }

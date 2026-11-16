@@ -16,6 +16,12 @@
 //!   one thread, clean #73 exit on EOF.
 //! - Engine fallbacks (`{"fallback": …}`) publish no diagnostics for that revision — the
 //!   pygls server's `diff is None` behaviour.
+//! - **Positions are source-aware**: engine `NodePosition` columns are UTF-8 byte offsets.
+//!   The server reads the ref baseline ONCE, diffs exactly that old buffer against the live
+//!   buffer, and maps ranges through the core's source-aware helpers with those same two
+//!   buffers. The position encoding is negotiated (`general.positionEncodings`): `utf-8`
+//!   when the client offers it (byte columns are then already exact), otherwise the
+//!   protocol default `utf-16`. No conversion algorithm lives in this binary.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -23,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use intentumdiff_lsp_client::{encode_message, DecodeEvent, FrameDecoder};
+use intentumdiff_rust_core::c_abi;
 use intentumdiff_rust_core::live_server as proto;
 use intentumdiff_rust_core::lsp_server_shapes as shapes;
 use serde_json::{json, Value};
@@ -149,12 +156,144 @@ struct ServerState {
     config_json: String,
     wasm_dir: String,
     supports_codelens_refresh: bool,
-    /// uri → last served SemanticDiff (the codeLens pull cache).
-    diff_cache: HashMap<String, Value>,
+    /// The negotiated LSP position encoding for every range this server emits.
+    position_encoding: PositionEncoding,
+    /// uri → code lenses mapped from the last served SemanticDiff (the codeLens pull
+    /// cache), already converted with the exact old/new buffers of that revision.
+    lens_cache: HashMap<String, Vec<Value>>,
     /// uri → latest known buffer content (didOpen/didChange).
     content_cache: HashMap<String, String>,
     /// id source for server→client requests (codeLens refresh).
     next_server_id: i64,
+}
+
+/// LSP `PositionEncodingKind` this server can emit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PositionEncoding {
+    /// UTF-8 code units — the engine's native byte columns.
+    Utf8,
+    /// UTF-16 code units — the protocol default every client must support.
+    Utf16,
+}
+
+impl PositionEncoding {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf-8",
+            Self::Utf16 => "utf-16",
+        }
+    }
+}
+
+/// Pick the position encoding from `initialize` params (LSP 3.17
+/// `general.positionEncodings`): `utf-8` when the client offers it, else `utf-16` (the
+/// mandatory default — also chosen when the client offers only `utf-32`).
+fn negotiate_position_encoding(params: &Value) -> PositionEncoding {
+    let offers_utf8 = params
+        .pointer("/capabilities/general/positionEncodings")
+        .and_then(Value::as_array)
+        .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("utf-8")));
+    if offers_utf8 {
+        PositionEncoding::Utf8
+    } else {
+        PositionEncoding::Utf16
+    }
+}
+
+/// Call a core C-ABI handler in-process and unwrap its `{"ok", "result" | "error"}`
+/// envelope. The error carries the core's `error_type` (e.g. `not_found`).
+fn core_call(name: &str, args: &[Value]) -> Result<Value, (String, String)> {
+    let envelope: Value = serde_json::from_str(&c_abi::dispatch(name, args))
+        .map_err(|e| ("internal".to_owned(), format!("{name}: invalid core envelope: {e}")))?;
+    if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(envelope.get("result").cloned().unwrap_or(Value::Null));
+    }
+    let kind = envelope.get("error_type").and_then(Value::as_str).unwrap_or("internal");
+    let message = envelope.get("error").and_then(Value::as_str).unwrap_or("core call failed");
+    Err((kind.to_owned(), format!("{name}: {message}")))
+}
+
+/// The ref baseline of `rel`, read strictly by the core (unresolvable refs and invalid
+/// UTF-8 are errors). A path absent at a valid commit is an addition: empty baseline.
+fn read_baseline(root: &Path, rel: &str, git_ref: &str) -> Result<String, String> {
+    let root = root.to_string_lossy();
+    match core_call("git_source_content", &[json!(root), json!(rel), json!(git_ref), json!(git_ref)]) {
+        Ok(pair) => pair
+            .get("old_content")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "git_source_content: missing old_content".to_owned()),
+        Err((kind, _)) if kind == "not_found" => Ok(String::new()),
+        Err((_, message)) => Err(message),
+    }
+}
+
+/// Diff the live `content` of `rel` against the ref with the live handler's semantics,
+/// returning the engine payload together with the EXACT baseline buffer it diffed, so
+/// ranges can be mapped against the same sources the engine positioned.
+fn diff_live_buffer(
+    state: &ServerState,
+    root: &Path,
+    rel: &str,
+    content: &str,
+) -> Result<(Value, String), String> {
+    let old_source = read_baseline(root, rel, &state.git_ref)?;
+    let payload = proto::live_diff_contents_impl(
+        &root.to_string_lossy(),
+        rel,
+        &old_source,
+        content,
+        &state.config_json,
+        &state.wasm_dir,
+    )?;
+    let parsed = serde_json::from_str(&payload).map_err(|e| format!("invalid engine payload: {e}"))?;
+    Ok((parsed, old_source))
+}
+
+/// STYLE_ONLY hints + parse-error warnings, positioned in `encoding`. Spans are always
+/// validated against `new_source` by the core's source-aware mapper (a stale or foreign
+/// buffer is an error, never a misplaced range); for `utf-8` the byte columns are
+/// already the LSP character offsets.
+fn diagnostics_for(
+    diff: &Value,
+    new_source: &str,
+    encoding: PositionEncoding,
+) -> Result<Vec<Value>, String> {
+    let utf16 = core_call(
+        "lsp_server_diagnostics_utf16",
+        &[json!(diff.to_string()), json!(new_source)],
+    )
+    .map_err(|(_, m)| m)?;
+    match encoding {
+        PositionEncoding::Utf16 => into_array(utf16),
+        PositionEncoding::Utf8 => Ok(shapes::semantic_diff_to_diagnostics_value(diff)),
+    }
+}
+
+/// Refactoring-family code lenses, positioned in `encoding`: new-node anchors against
+/// `new_source`, old-only anchors against `old_source` (side selection is the core's).
+fn lenses_for(
+    diff: &Value,
+    old_source: &str,
+    new_source: &str,
+    encoding: PositionEncoding,
+) -> Result<Vec<Value>, String> {
+    let utf16 = core_call(
+        "lsp_server_codelens_utf16",
+        &[json!(diff.to_string()), json!(old_source), json!(new_source)],
+    )
+    .map_err(|(_, m)| m)?;
+    match encoding {
+        PositionEncoding::Utf16 => into_array(utf16),
+        PositionEncoding::Utf8 => Ok(shapes::semantic_diff_to_codelens_value(diff)),
+    }
+}
+
+fn into_array(value: Value) -> Result<Vec<Value>, String> {
+    match value {
+        Value::Array(items) => Ok(items),
+        other => Err(format!("expected an array of LSP shapes, got {other}")),
+    }
 }
 
 fn write_msg(out: &mut impl Write, msg: &Value) {
@@ -184,7 +323,8 @@ fn main() {
         config_json: "{}".to_owned(),
         wasm_dir,
         supports_codelens_refresh: false,
-        diff_cache: HashMap::new(),
+        position_encoding: PositionEncoding::Utf16,
+        lens_cache: HashMap::new(),
         content_cache: HashMap::new(),
         next_server_id: 1,
     };
@@ -267,12 +407,14 @@ fn main() {
                         .pointer("/capabilities/workspace/codeLens/refreshSupport")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    state.position_encoding = negotiate_position_encoding(&params);
                     if let Some(id) = id {
                         respond(
                             &mut out,
                             id,
                             json!({
                                 "capabilities": {
+                                    "positionEncoding": state.position_encoding.as_str(),
                                     "textDocumentSync": 1,
                                     "codeLensProvider": {"resolveProvider": false},
                                 },
@@ -310,7 +452,7 @@ fn main() {
                 }
                 "textDocument/didClose" => {
                     if let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) {
-                        state.diff_cache.remove(uri);
+                        state.lens_cache.remove(uri);
                         state.content_cache.remove(uri);
                         dirty.retain(|u| u != uri);
                     }
@@ -320,11 +462,7 @@ fn main() {
                         .pointer("/textDocument/uri")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let lenses = state
-                        .diff_cache
-                        .get(uri)
-                        .map(|diff| shapes::semantic_diff_to_codelens_value(diff))
-                        .unwrap_or_default();
+                    let lenses = state.lens_cache.get(uri).cloned().unwrap_or_default();
                     if let Some(id) = id {
                         respond(&mut out, id, Value::Array(lenses));
                     }
@@ -359,29 +497,25 @@ fn main() {
     let _ = reader.join();
 }
 
-/// `_compute_and_push`: diff the live buffer against the ref, cache for codeLens, publish
-/// diagnostics, and nudge the client's lens refresh when supported. Engine fallbacks and
-/// out-of-root files publish nothing (the pygls `diff is None` path).
+/// `_compute_and_push`: diff the live buffer against the ref, map diagnostics + lenses
+/// with that revision's exact old/new buffers, cache the lenses for codeLens, publish
+/// diagnostics, and nudge the client's lens refresh when supported. Engine fallbacks,
+/// mapping failures and out-of-root files publish nothing (the pygls `diff is None` path).
 fn compute_and_push(state: &mut ServerState, out: &mut impl Write, uri: &str) {
     let Some(root) = state.root.clone() else { return };
     let Some(content) = state.content_cache.get(uri).cloned() else { return };
     let Ok(file_path) = uri_to_path(uri, Some(&root)) else { return };
     let Ok(rel) = file_path.strip_prefix(&root) else { return };
     let rel = rel.to_string_lossy().replace('\\', "/");
-    let served = proto::live_handle_diff_impl(
-        &root.to_string_lossy(),
-        &rel,
-        &state.git_ref,
-        &content,
-        &state.config_json,
-        &state.wasm_dir,
-    );
-    let Ok(payload) = served else { return };
-    let Some(parsed) = serde_json::from_str::<Value>(&payload).ok() else { return };
-    let Some(diff) = parsed.get("diff").cloned() else { return };
+    let Ok((parsed, old_source)) = diff_live_buffer(state, &root, &rel, &content) else {
+        return;
+    };
+    let Some(diff) = parsed.get("diff") else { return };
+    let encoding = state.position_encoding;
+    let Ok(diagnostics) = diagnostics_for(diff, &content, encoding) else { return };
+    let Ok(lenses) = lenses_for(diff, &old_source, &content, encoding) else { return };
 
-    let diagnostics = shapes::semantic_diff_to_diagnostics_value(&diff);
-    state.diff_cache.insert(uri.to_owned(), diff);
+    state.lens_cache.insert(uri.to_owned(), lenses);
     write_msg(
         out,
         &json!({
@@ -425,15 +559,7 @@ fn semantic_diff_request(state: &mut ServerState, params: &Value) -> Value {
                 .map_err(|_| "file is outside the workspace root".to_owned())?
                 .to_string_lossy()
                 .replace('\\', "/");
-            let payload = proto::live_handle_diff_impl(
-                &root.to_string_lossy(),
-                &rel,
-                &state.git_ref,
-                &content,
-                &state.config_json,
-                &state.wasm_dir,
-            )?;
-            Ok(serde_json::from_str(&payload).unwrap_or(Value::Null))
+            diff_live_buffer(state, &root, &rel, &content).map(|(parsed, _)| parsed)
         } else {
             let old_path = uri_to_path(old_uri, Some(&root))?;
             let new_path = uri_to_path(new_uri, Some(&root))?;
@@ -486,6 +612,102 @@ mod tests {
             let p = uri_to_path("file:///C:/Users/x.py", None).unwrap();
             assert!(p.to_string_lossy().starts_with("C:"));
         }
+    }
+
+    fn style_diff(start: (u64, u64), end: (u64, u64)) -> Value {
+        json!({
+            "changes": [{
+                "change_type": "STYLE_ONLY",
+                "description": "style",
+                "new_node": {"position": {
+                    "start_line": start.0, "start_col": start.1,
+                    "end_line": end.0, "end_col": end.1,
+                }},
+            }],
+            "parse_errors": [],
+        })
+    }
+
+    fn range_of(shape: &Value) -> ((i64, i64), (i64, i64)) {
+        let r = &shape["range"];
+        let p = |k: &str| (r[k]["line"].as_i64().unwrap(), r[k]["character"].as_i64().unwrap());
+        (p("start"), p("end"))
+    }
+
+    #[test]
+    fn diagnostics_use_utf16_code_units_by_default() {
+        // ECO-04: `été` is 5 UTF-8 bytes but 3 UTF-16 code units.
+        let diags = diagnostics_for(&style_diff((0, 0), (0, 5)), "été", PositionEncoding::Utf16).unwrap();
+        assert_eq!(range_of(&diags[0]), ((0, 0), (0, 3)));
+        // Astral-plane emoji: 4 bytes, 2 UTF-16 units.
+        let diags = diagnostics_for(&style_diff((0, 1), (0, 6)), "a😀bc", PositionEncoding::Utf16).unwrap();
+        assert_eq!(range_of(&diags[0]), ((0, 1), (0, 4)));
+        // Combining mark: e + U+0301 (2 bytes) is two UTF-16 units, not one grapheme.
+        let diags = diagnostics_for(&style_diff((0, 0), (0, 4)), "e\u{301}xy", PositionEncoding::Utf16).unwrap();
+        assert_eq!(range_of(&diags[0]), ((0, 0), (0, 3)));
+        // Multiline, CRLF: each line is measured on its own text.
+        let diags = diagnostics_for(&style_diff((0, 2), (1, 3)), "é\r\nüx", PositionEncoding::Utf16).unwrap();
+        assert_eq!(range_of(&diags[0]), ((0, 1), (1, 2)));
+    }
+
+    #[test]
+    fn negotiated_utf8_keeps_the_engine_byte_columns() {
+        let diags = diagnostics_for(&style_diff((0, 0), (0, 5)), "été", PositionEncoding::Utf8).unwrap();
+        assert_eq!(range_of(&diags[0]), ((0, 0), (0, 5)));
+    }
+
+    #[test]
+    fn stale_or_foreign_buffers_are_rejected_not_misplaced() {
+        // A span that does not fit the buffer (wrong revision) must fail in either encoding.
+        for enc in [PositionEncoding::Utf16, PositionEncoding::Utf8] {
+            assert!(diagnostics_for(&style_diff((0, 0), (0, 9)), "été", enc).is_err());
+            assert!(diagnostics_for(&style_diff((3, 0), (3, 1)), "été", enc).is_err());
+            // Byte column 1 splits `é`.
+            assert!(diagnostics_for(&style_diff((0, 1), (0, 3)), "été", enc).is_err());
+        }
+    }
+
+    #[test]
+    fn code_lenses_map_each_node_against_its_own_side() {
+        let diff = json!({
+            "changes": [
+                // Old-only anchor: measured on the OLD source.
+                {"change_type": "MOVE", "description": "moved",
+                 "new_node": null,
+                 "old_node": {"position": {"start_line": 0, "start_col": 0, "end_line": 0, "end_col": 4}}},
+                // New anchor: measured on the NEW source.
+                {"change_type": "REFACTORING", "refactoring_kind": "RENAME", "description": "renamed",
+                 "new_node": {"position": {"start_line": 0, "start_col": 2, "end_line": 0, "end_col": 6}},
+                 "old_node": {"position": {"start_line": 0, "start_col": 0, "end_line": 0, "end_col": 1}}},
+            ],
+            "parse_errors": [],
+        });
+        let old = "ééé";
+        let new = "ab😀";
+        let lenses = lenses_for(&diff, old, new, PositionEncoding::Utf16).unwrap();
+        assert_eq!(lenses.len(), 2);
+        assert_eq!(range_of(&lenses[0]), ((0, 0), (0, 2)));
+        assert_eq!(range_of(&lenses[1]), ((0, 2), (0, 4)));
+        assert!(lenses[1]["command"]["title"].as_str().unwrap().contains("RENAME"));
+        // Swapping the buffers puts the old anchor's byte 4 inside the emoji → refused.
+        assert!(lenses_for(&diff, new, old, PositionEncoding::Utf16).is_err());
+        // utf-8: byte columns pass through.
+        let lenses = lenses_for(&diff, old, new, PositionEncoding::Utf8).unwrap();
+        assert_eq!(range_of(&lenses[0]), ((0, 0), (0, 4)));
+    }
+
+    #[test]
+    fn position_encoding_negotiation_follows_lsp_3_17() {
+        let neg = |caps: Value| negotiate_position_encoding(&json!({"capabilities": caps}));
+        assert_eq!(neg(json!({})), PositionEncoding::Utf16);
+        assert_eq!(neg(json!({"general": {"positionEncodings": ["utf-16"]}})), PositionEncoding::Utf16);
+        assert_eq!(neg(json!({"general": {"positionEncodings": ["utf-32"]}})), PositionEncoding::Utf16);
+        assert_eq!(
+            neg(json!({"general": {"positionEncodings": ["utf-16", "utf-8"]}})),
+            PositionEncoding::Utf8
+        );
+        assert_eq!(PositionEncoding::Utf8.as_str(), "utf-8");
+        assert_eq!(PositionEncoding::Utf16.as_str(), "utf-16");
     }
 
     #[test]
