@@ -20,7 +20,11 @@
 //!   its lenses; a revision whose compute fails publishes one Information diagnostic that
 //!   says why (never relabelled as a clean diff) and drops its lenses; `didClose` publishes
 //!   empty diagnostics and drops lenses. Lens drops trigger `workspace/codeLens/refresh`
-//!   when the client supports it.
+//!   when the client supports it. An **incomplete** review (core #252) is never published as
+//!   clean: core's `incomplete.message` is published verbatim, as Information diagnostics on
+//!   core's `source_ranges`, and a "Report IntentumDiff bug…" code action previews core's
+//!   exact report title/body (`window/showMessageRequest`, Open/Cancel). Only an explicit
+//!   Open calls `window/showDocument` (external) on `report.issue_url`; nothing is sent.
 //! - **Bounded memory** (see [`Limits`]): the reader→main queue holds at most
 //!   `max_pending_messages` frames / `max_pending_bytes` of estimated payload (one frame
 //!   larger than that is still admitted alone). A full queue blocks the reader — the
@@ -374,6 +378,22 @@ struct ServerState {
     cached_bytes: usize,
     /// Source of `Doc::touched` stamps.
     clock: u64,
+    /// uri → the core's `incomplete` object of the last served revision when that review
+    /// was `completeness: "incomplete"` (core #252). Backs the "Report IntentumDiff bug…"
+    /// code action; replaced or dropped with every later outcome for the URI.
+    incomplete_cache: HashMap<String, IncompleteReview>,
+    /// Outstanding `window/showMessageRequest` report previews: request id → the
+    /// `report.issue_url` to open if (and only if) the user picks [`REPORT_OPEN`].
+    pending_reports: HashMap<i64, String>,
+    /// The client can open external URIs (`window.showDocument.support`).
+    supports_show_document: bool,
+}
+
+/// The served `incomplete` report of one document revision.
+#[derive(Clone, Debug)]
+struct IncompleteReview {
+    version: Option<i64>,
+    incomplete: Value,
 }
 
 /// LSP `PositionEncodingKind` this server can emit.
@@ -521,6 +541,9 @@ impl ServerState {
             limits: Limits::default(),
             cached_bytes: 0,
             clock: 0,
+            incomplete_cache: HashMap::new(),
+            pending_reports: HashMap::new(),
+            supports_show_document: false,
         }
     }
 
@@ -556,6 +579,7 @@ impl ServerState {
             let Some(victim) = victim else { break }; // only `keep` is left
             self.remove_doc(&victim);
             self.lens_cache.remove(&victim);
+            self.incomplete_cache.remove(&victim);
             evicted.push(victim);
         }
         evicted
@@ -650,144 +674,10 @@ fn main() {
         // Debounce by coalescing: take whatever is already buffered, then keep only the
         // LATEST content per URI. Everything else is handled in arrival order.
         let mut dirty: Vec<String> = Vec::new();
-        for mut msg in batch {
-            let method = method_of(&msg).to_owned();
-            let method = method.as_str();
-            if method.is_empty() {
-                continue; // a response to one of OUR requests (codeLens refresh) — ignore
-            }
-            // Move (not clone) the params out: a full-sync text is the bulk of the frame.
-            let params = msg.get_mut("params").map(Value::take).unwrap_or(Value::Null);
-            let id = msg.get("id");
-            if state.shutdown_requested && method != "exit" {
-                if let Some(id) = id {
-                    respond_error(&mut out, id, -32600, "server is shutting down");
-                }
-                continue;
-            }
-            match method {
-                "initialize" => {
-                    let root_uri = params
-                        .get("rootUri")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            params
-                                .get("workspaceFolders")
-                                .and_then(Value::as_array)
-                                .and_then(|f| f.first())
-                                .and_then(|f| f.get("uri"))
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                        });
-                    if let Some(uri) = root_uri {
-                        if let Ok(path) = uri_to_path(&uri, None) {
-                            // Repo config, same precedence as the live-server binary.
-                            if let Ok(loaded) =
-                                proto::live_load_project_config_impl(&path.to_string_lossy())
-                            {
-                                if loaded.trim() != "{}" {
-                                    state.config_json = loaded;
-                                }
-                            }
-                            state.root = Some(path);
-                        }
-                    }
-                    state.supports_codelens_refresh = params
-                        .pointer("/capabilities/workspace/codeLens/refreshSupport")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    state.position_encoding = negotiate_position_encoding(&params);
-                    if let Some(id) = id {
-                        respond(
-                            &mut out,
-                            id,
-                            json!({
-                                "capabilities": {
-                                    "positionEncoding": state.position_encoding.as_str(),
-                                    "textDocumentSync": 1,
-                                    "codeLensProvider": {"resolveProvider": false},
-                                },
-                                "serverInfo": {"name": "intentumdiff-lsp", "version": "1.0.0"},
-                            }),
-                        );
-                    }
-                }
-                "initialized" => {}
-                "textDocument/didOpen" => {
-                    let uri = params.pointer("/textDocument/uri").and_then(Value::as_str);
-                    let text = params.pointer("/textDocument/text").and_then(Value::as_str);
-                    let version = params.pointer("/textDocument/version").and_then(Value::as_i64);
-                    if let (Some(uri), Some(text)) = (uri, text) {
-                        // (Re)open starts a fresh version history for the URI.
-                        state.store_doc(uri, text, version);
-                        if !dirty.iter().any(|u| u == uri) {
-                            dirty.push(uri.to_owned());
-                        }
-                        enforce_document_limits(&mut state, &mut out, &mut dirty, uri);
-                    }
-                }
-                "textDocument/didChange" => {
-                    let uri = params.pointer("/textDocument/uri").and_then(Value::as_str);
-                    // Full sync — the last (and only) item is the complete document.
-                    let text = params
-                        .get("contentChanges")
-                        .and_then(Value::as_array)
-                        .and_then(|c| c.last())
-                        .and_then(|c| c.get("text"))
-                        .and_then(Value::as_str);
-                    let version = params.pointer("/textDocument/version").and_then(Value::as_i64);
-                    if let (Some(uri), Some(text)) = (uri, text) {
-                        if accept_change(&mut state, uri, text, version) {
-                            if !dirty.iter().any(|u| u == uri) {
-                                dirty.push(uri.to_owned());
-                            }
-                            enforce_document_limits(&mut state, &mut out, &mut dirty, uri);
-                        }
-                    }
-                }
-                "textDocument/didClose" => {
-                    if let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) {
-                        state.remove_doc(uri);
-                        dirty.retain(|u| u != uri);
-                        let had_lenses = state.lens_cache.remove(uri).is_some();
-                        publish_diagnostics(&mut out, uri, None, &[]);
-                        if had_lenses {
-                            request_codelens_refresh(&mut state, &mut out);
-                        }
-                    }
-                }
-                "textDocument/codeLens" => {
-                    let uri = params
-                        .pointer("/textDocument/uri")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let lenses = state.lens_cache.get(uri).cloned().unwrap_or_default();
-                    if let Some(id) = id {
-                        respond(&mut out, id, Value::Array(lenses));
-                    }
-                }
-                "intentumdiff/semanticDiff" => {
-                    if let Some(id) = id {
-                        let result = semantic_diff_request(&mut state, &params);
-                        respond(&mut out, id, result);
-                    }
-                }
-                "shutdown" => {
-                    state.shutdown_requested = true;
-                    if let Some(id) = id {
-                        respond(&mut out, id, Value::Null);
-                    }
-                }
-                "exit" => {
-                    exit_code = Some(if state.shutdown_requested { 0 } else { 1 });
-                    break 'main;
-                }
-                _ => {
-                    if let Some(id) = id {
-                        respond_error(&mut out, id, -32601, &format!("method not found: {method}"));
-                    }
-                }
+        for msg in batch {
+            if let Some(code) = handle_message(&mut state, &mut out, msg, &mut dirty) {
+                exit_code = Some(code);
+                break 'main;
             }
         }
 
@@ -810,6 +700,178 @@ fn main() {
     let _ = reader.join();
 }
 
+/// Handle one client frame. Returns the process exit code once protocol `exit` arrives.
+/// Document changes only mark their URI dirty; the caller computes once per batch.
+fn handle_message(
+    state: &mut ServerState,
+    out: &mut impl Write,
+    mut msg: Value,
+    dirty: &mut Vec<String>,
+) -> Option<i32> {
+    let method = method_of(&msg).to_owned();
+    let method = method.as_str();
+    if method.is_empty() {
+        // A response to one of OUR requests (codeLens refresh, report preview, showDocument).
+        if !state.shutdown_requested {
+            handle_client_response(state, out, &msg);
+        }
+        return None;
+    }
+    // Move (not clone) the params out: a full-sync text is the bulk of the frame.
+    let params = msg.get_mut("params").map(Value::take).unwrap_or(Value::Null);
+    let id = msg.get("id");
+    if state.shutdown_requested && method != "exit" {
+        if let Some(id) = id {
+            respond_error(out, id, -32600, "server is shutting down");
+        }
+        return None;
+    }
+    match method {
+        "initialize" => {
+            let root_uri = params
+                .get("rootUri")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    params
+                        .get("workspaceFolders")
+                        .and_then(Value::as_array)
+                        .and_then(|f| f.first())
+                        .and_then(|f| f.get("uri"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            if let Some(uri) = root_uri {
+                if let Ok(path) = uri_to_path(&uri, None) {
+                    // Repo config, same precedence as the live-server binary.
+                    if let Ok(loaded) =
+                        proto::live_load_project_config_impl(&path.to_string_lossy())
+                    {
+                        if loaded.trim() != "{}" {
+                            state.config_json = loaded;
+                        }
+                    }
+                    state.root = Some(path);
+                }
+            }
+            state.supports_codelens_refresh = params
+                .pointer("/capabilities/workspace/codeLens/refreshSupport")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            state.position_encoding = negotiate_position_encoding(&params);
+            state.supports_show_document = params
+                .pointer("/capabilities/window/showDocument/support")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(id) = id {
+                respond(
+                    out,
+                    id,
+                    json!({
+                        "capabilities": {
+                            "positionEncoding": state.position_encoding.as_str(),
+                            "textDocumentSync": 1,
+                            "codeLensProvider": {"resolveProvider": false},
+                            "codeActionProvider": {"codeActionKinds": ["quickfix"]},
+                            "executeCommandProvider": {"commands": [REPORT_COMMAND]},
+                        },
+                        "serverInfo": {"name": "intentumdiff-lsp", "version": "1.0.0"},
+                    }),
+                );
+            }
+        }
+        "initialized" => {}
+        "textDocument/didOpen" => {
+            let uri = params.pointer("/textDocument/uri").and_then(Value::as_str);
+            let text = params.pointer("/textDocument/text").and_then(Value::as_str);
+            let version = params.pointer("/textDocument/version").and_then(Value::as_i64);
+            if let (Some(uri), Some(text)) = (uri, text) {
+                // (Re)open starts a fresh version history for the URI.
+                state.store_doc(uri, text, version);
+                if !dirty.iter().any(|u| u == uri) {
+                    dirty.push(uri.to_owned());
+                }
+                enforce_document_limits(state, out, dirty, uri);
+            }
+        }
+        "textDocument/didChange" => {
+            let uri = params.pointer("/textDocument/uri").and_then(Value::as_str);
+            // Full sync — the last (and only) item is the complete document.
+            let text = params
+                .get("contentChanges")
+                .and_then(Value::as_array)
+                .and_then(|c| c.last())
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str);
+            let version = params.pointer("/textDocument/version").and_then(Value::as_i64);
+            if let (Some(uri), Some(text)) = (uri, text) {
+                if accept_change(state, uri, text, version) {
+                    if !dirty.iter().any(|u| u == uri) {
+                        dirty.push(uri.to_owned());
+                    }
+                    enforce_document_limits(state, out, dirty, uri);
+                }
+            }
+        }
+        "textDocument/didClose" => {
+            if let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) {
+                state.remove_doc(uri);
+                dirty.retain(|u| u != uri);
+                state.incomplete_cache.remove(uri);
+                let had_lenses = state.lens_cache.remove(uri).is_some();
+                publish_diagnostics(out, uri, None, &[]);
+                if had_lenses {
+                    request_codelens_refresh(state, out);
+                }
+            }
+        }
+        "textDocument/codeLens" => {
+            let uri = params
+                .pointer("/textDocument/uri")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let lenses = state.lens_cache.get(uri).cloned().unwrap_or_default();
+            if let Some(id) = id {
+                respond(out, id, Value::Array(lenses));
+            }
+        }
+        "textDocument/codeAction" => {
+            if let Some(id) = id {
+                respond(out, id, code_actions(state, &params));
+            }
+        }
+        "workspace/executeCommand" => {
+            if let Some(id) = id {
+                match execute_command(state, out, &params) {
+                    Ok(()) => respond(out, id, Value::Null),
+                    Err((code, message)) => respond_error(out, id, code, &message),
+                }
+            }
+        }
+        "intentumdiff/semanticDiff" => {
+            if let Some(id) = id {
+                let result = semantic_diff_request(state, &params);
+                respond(out, id, result);
+            }
+        }
+        "shutdown" => {
+            state.shutdown_requested = true;
+            if let Some(id) = id {
+                respond(out, id, Value::Null);
+            }
+        }
+        "exit" => {
+            return Some(if state.shutdown_requested { 0 } else { 1 });
+        }
+        _ => {
+            if let Some(id) = id {
+                respond_error(out, id, -32601, &format!("method not found: {method}"));
+            }
+        }
+    }
+    None
+}
+
 /// Apply a full-sync `didChange` unless it is stale: a change whose version is not newer
 /// than the buffer's (late / out-of-order delivery) is dropped. Returns whether the buffer
 /// changed. A change for a URI that was never opened is accepted as its first revision.
@@ -830,8 +892,10 @@ fn accept_change(state: &mut ServerState, uri: &str, text: &str, version: Option
 enum Outcome {
     /// Nothing is ever published for this URI (no workspace root / outside it).
     NotServed,
-    /// A semantic diff, already mapped for the negotiated encoding.
-    Diff { diagnostics: Vec<Value>, lenses: Vec<Value> },
+    /// A semantic diff, already mapped for the negotiated encoding. `incomplete` is the
+    /// core's `incomplete` object when the review is `completeness: "incomplete"`; its
+    /// diagnostics are already part of `diagnostics`.
+    Diff { diagnostics: Vec<Value>, lenses: Vec<Value>, incomplete: Option<Value> },
     /// The engine declined this revision (`{"fallback": reason}`).
     Declined(String),
     /// The compute or the mapping failed.
@@ -856,10 +920,20 @@ fn compute_outcome(state: &ServerState, uri: &str, content: &str) -> Outcome {
         };
     };
     let encoding = state.position_encoding;
+    let incomplete = match incomplete_of(diff) {
+        Ok(incomplete) => incomplete,
+        Err(e) => return Outcome::Failed(e),
+    };
     let mapped = diagnostics_for(diff, content, encoding)
-        .and_then(|d| lenses_for(diff, &old_source, content, encoding).map(|l| (d, l)));
+        .and_then(|d| lenses_for(diff, &old_source, content, encoding).map(|l| (d, l)))
+        .and_then(|(mut d, l)| {
+            if let Some(incomplete) = &incomplete {
+                d.extend(incomplete_diagnostics(incomplete, content, encoding)?);
+            }
+            Ok((d, l))
+        });
     match mapped {
-        Ok((diagnostics, lenses)) => Outcome::Diff { diagnostics, lenses },
+        Ok((diagnostics, lenses)) => Outcome::Diff { diagnostics, lenses, incomplete },
         Err(e) => Outcome::Failed(format!("position mapping failed: {e}")),
     }
 }
@@ -872,6 +946,209 @@ fn failure_diagnostic(reason: &str) -> Value {
         "message": format!("Semantic diff unavailable for this revision: {reason}"),
         "source": "intentumdiff",
     })
+}
+
+/// `workspace/executeCommand` id of the "Report IntentumDiff bug…" code action.
+const REPORT_COMMAND: &str = "intentumdiff.reportIncompleteReview";
+/// Code-action title offered on an incomplete review.
+const REPORT_ACTION_TITLE: &str = "Report IntentumDiff bug\u{2026}";
+/// Diagnostic `code` of the incomplete-review diagnostic (ties it to the code action).
+const INCOMPLETE_CODE: &str = "incomplete_review";
+/// The ONLY preview choice that opens `report.issue_url`.
+const REPORT_OPEN: &str = "Open";
+const REPORT_CANCEL: &str = "Cancel";
+
+/// The review's `incomplete` object when core classified it `completeness: "incomplete"`
+/// (core #252), else `None`. An incomplete review without its core-authored object is
+/// refused (it must never be shown as a clean, empty review).
+fn incomplete_of(diff: &Value) -> Result<Option<Value>, String> {
+    if diff.get("completeness").and_then(Value::as_str) != Some("incomplete") {
+        return Ok(None);
+    }
+    match diff.get("incomplete") {
+        Some(incomplete) if incomplete.get("message").and_then(Value::as_str).is_some() => {
+            Ok(Some(incomplete.clone()))
+        }
+        _ => Err("incomplete review without the core's incomplete report".to_owned()),
+    }
+}
+
+/// One Information diagnostic per core `source_ranges` hunk (one at the top of the file
+/// when core recorded none), each carrying `incomplete.message` VERBATIM. The hunk's
+/// new-side byte span is positioned through the core's source-aware range mapper against
+/// the exact buffer that was diffed, so a foreign buffer is an error, never a misplaced
+/// range. No `codeDescription` link: the report URL is only ever opened from the
+/// confirmed preview (see [`execute_command`]).
+fn incomplete_diagnostics(
+    incomplete: &Value,
+    new_source: &str,
+    encoding: PositionEncoding,
+) -> Result<Vec<Value>, String> {
+    let message = incomplete
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or("incomplete review without a message")?;
+    let diagnostic = |range: Value| {
+        json!({
+            "range": range,
+            "severity": 3,
+            "code": INCOMPLETE_CODE,
+            "source": "intentumdiff",
+            "message": message,
+        })
+    };
+    let empty = Vec::new();
+    let hunks = incomplete.get("source_ranges").and_then(Value::as_array).unwrap_or(&empty);
+    if hunks.is_empty() {
+        let top = json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}});
+        return Ok(vec![diagnostic(top)]);
+    }
+    hunks
+        .iter()
+        .map(|hunk| incomplete_hunk_range(hunk, new_source, encoding).map(diagnostic))
+        .collect()
+}
+
+/// A `source_ranges` hunk's new side (`new_start_byte`..`new_end_byte`, zero-based
+/// `new_start_line`/`new_end_line`) as an LSP range in `encoding`.
+fn incomplete_hunk_range(hunk: &Value, source: &str, encoding: PositionEncoding) -> Result<Value, String> {
+    let field = |name: &str| -> Result<usize, String> {
+        hunk.get(name)
+            .and_then(Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| format!("incomplete source range lacks {name}"))
+    };
+    let point = |byte: usize, line: usize| -> Result<(usize, usize), String> {
+        let prefix = source
+            .get(..byte)
+            .ok_or_else(|| format!("incomplete source range byte {byte} does not fit the buffer"))?;
+        if prefix.matches('\n').count() != line {
+            return Err(format!("incomplete source range line {line} does not match byte {byte}"));
+        }
+        let line_start = prefix.rfind('\n').map_or(0, |i| i + 1);
+        Ok((line, byte - line_start))
+    };
+    let (start_line, start_col) = point(field("new_start_byte")?, field("new_start_line")?)?;
+    let (end_line, end_col) = point(field("new_end_byte")?, field("new_end_line")?)?;
+    let node = json!({"position": {"start_line": start_line, "start_col": start_col,
+                                   "end_line": end_line, "end_col": end_col}});
+    // Always validated by the core; for utf-8 the byte columns are already exact.
+    let utf16 = core_call("lsp_utf16_range", &[json!(node.to_string()), json!(source)])
+        .map_err(|(_, m)| m)?;
+    Ok(match encoding {
+        PositionEncoding::Utf16 => utf16,
+        PositionEncoding::Utf8 => json!({
+            "start": {"line": start_line, "character": start_col},
+            "end": {"line": end_line, "character": end_col},
+        }),
+    })
+}
+
+/// `textDocument/codeAction`: "Report IntentumDiff bug…" while the document's current
+/// review is incomplete. The action only runs [`REPORT_COMMAND`]; nothing is opened yet.
+fn code_actions(state: &ServerState, params: &Value) -> Value {
+    let uri = params.pointer("/textDocument/uri").and_then(Value::as_str).unwrap_or("");
+    let Some(review) = state.incomplete_cache.get(uri) else { return json!([]) };
+    let diagnostics: Vec<Value> = params
+        .pointer("/context/diagnostics")
+        .and_then(Value::as_array)
+        .map(|d| d.iter().filter(|d| d["code"] == INCOMPLETE_CODE).cloned().collect())
+        .unwrap_or_default();
+    json!([{
+        "title": REPORT_ACTION_TITLE,
+        "kind": "quickfix",
+        "diagnostics": diagnostics,
+        "command": {
+            "title": REPORT_ACTION_TITLE,
+            "command": REPORT_COMMAND,
+            "arguments": [uri, review.version],
+        },
+    }])
+}
+
+/// The preview text of a core report: its exact `title` and complete `body_markdown`.
+fn report_preview(report: &Value) -> Result<(String, String), String> {
+    let text = |name: &str| {
+        report.get(name).and_then(Value::as_str).ok_or_else(|| format!("incomplete report lacks {name}"))
+    };
+    let (title, body, issue_url) = (text("title")?, text("body_markdown")?, text("issue_url")?);
+    if !issue_url.starts_with("https://") {
+        return Err("incomplete report issue_url is not an https URL".to_owned());
+    }
+    let mut message = format!("{title}\n\n");
+    if report.get("truncated").and_then(Value::as_bool) == Some(true) {
+        message.push_str(
+            "Note: this report is too long for the issue link, so the opened issue carries a \
+             shortened body. The full report body is shown below; paste it into the issue.\n\n",
+        );
+    }
+    message.push_str(body);
+    message.push_str(&format!(
+        "\n\n{REPORT_OPEN} opens this pre-filled issue in your browser. Nothing is sent \
+         unless you submit it there."
+    ));
+    Ok((message, issue_url.to_owned()))
+}
+
+/// `workspace/executeCommand` [`REPORT_COMMAND`] `[uri, version]`: preview the core's
+/// report with `window/showMessageRequest` (Open / Cancel). The URL is opened later, and
+/// only when the user picks Open ([`handle_client_response`]). Core never sends anything,
+/// and neither does this server: the user submits the issue in their browser.
+fn execute_command(state: &mut ServerState, out: &mut impl Write, params: &Value) -> Result<(), (i64, String)> {
+    let invalid = |m: &str| (-32602, m.to_owned());
+    if params.get("command").and_then(Value::as_str) != Some(REPORT_COMMAND) {
+        return Err(invalid("unknown command"));
+    }
+    let args = params.get("arguments").and_then(Value::as_array);
+    let uri = args.and_then(|a| a.first()).and_then(Value::as_str).ok_or_else(|| invalid("missing document uri"))?;
+    let review = state
+        .incomplete_cache
+        .get(uri)
+        .ok_or_else(|| invalid("this document has no incomplete review to report"))?;
+    if let Some(requested) = args.and_then(|a| a.get(1)).filter(|v| !v.is_null()) {
+        if review.version.map(Value::from).as_ref() != Some(requested) {
+            return Err(invalid("the review changed since this action was offered; request it again"));
+        }
+    }
+    let report = review.incomplete.get("report").ok_or_else(|| invalid("incomplete review has no report"))?;
+    let (message, issue_url) = report_preview(report).map_err(|m| invalid(&m))?;
+    let id = state.next_server_id;
+    state.next_server_id += 1;
+    state.pending_reports.insert(id, issue_url);
+    write_msg(
+        out,
+        &json!({"jsonrpc": "2.0", "id": id, "method": "window/showMessageRequest",
+                "params": {"type": 3, "message": message,
+                           "actions": [{"title": REPORT_OPEN}, {"title": REPORT_CANCEL}]}}),
+    );
+    Ok(())
+}
+
+/// A client response to one of this server's requests. A report preview answered with
+/// exactly [`REPORT_OPEN`] opens its `issue_url` externally; any other answer (Cancel,
+/// dismissal → `null`, an error) opens nothing.
+fn handle_client_response(state: &mut ServerState, out: &mut impl Write, msg: &Value) {
+    let Some(id) = msg.get("id").and_then(Value::as_i64) else { return };
+    let Some(issue_url) = state.pending_reports.remove(&id) else { return };
+    if msg.pointer("/result/title").and_then(Value::as_str) != Some(REPORT_OPEN) {
+        return;
+    }
+    if state.supports_show_document {
+        let id = state.next_server_id;
+        state.next_server_id += 1;
+        write_msg(
+            out,
+            &json!({"jsonrpc": "2.0", "id": id, "method": "window/showDocument",
+                    "params": {"uri": issue_url, "external": true}}),
+        );
+    } else {
+        // The client cannot open URIs: hand the user the link instead of opening it.
+        write_msg(
+            out,
+            &json!({"jsonrpc": "2.0", "method": "window/showMessage",
+                    "params": {"type": 3, "message": format!("Open this link to file the report: {issue_url}")}}),
+        );
+    }
 }
 
 fn publish_diagnostics(out: &mut impl Write, uri: &str, version: Option<i64>, diagnostics: &[Value]) {
@@ -916,12 +1193,21 @@ fn apply_outcome(
 ) {
     match outcome {
         Outcome::NotServed => {}
-        Outcome::Diff { diagnostics, lenses } => {
+        Outcome::Diff { diagnostics, lenses, incomplete } => {
             state.lens_cache.insert(uri.to_owned(), lenses);
+            match incomplete {
+                Some(incomplete) => {
+                    state.incomplete_cache.insert(uri.to_owned(), IncompleteReview { version, incomplete });
+                }
+                None => {
+                    state.incomplete_cache.remove(uri);
+                }
+            }
             publish_diagnostics(out, uri, version, &diagnostics);
             request_codelens_refresh(state, out);
         }
         Outcome::Declined(_) | Outcome::Failed(_) => {
+            state.incomplete_cache.remove(uri);
             let had_lenses = state.lens_cache.remove(uri).is_some();
             let diagnostics = match &outcome {
                 Outcome::Failed(reason) => vec![failure_diagnostic(reason)],
@@ -1141,7 +1427,7 @@ mod tests {
         let lens = json!({"range": {}, "command": {"title": "t", "command": ""}});
         let mut out = Vec::new();
         apply_outcome(&mut state, &mut out, "u", Some(1),
-                      Outcome::Diff { diagnostics: vec![json!({"x": 1})], lenses: vec![lens] });
+                      Outcome::Diff { diagnostics: vec![json!({"x": 1})], lenses: vec![lens], incomplete: None });
         let msgs = frames(&out);
         assert_eq!(msgs[0]["params"]["version"], 1);
         assert_eq!(msgs[0]["params"]["diagnostics"].as_array().unwrap().len(), 1);
@@ -1309,5 +1595,219 @@ mod tests {
         assert!(uri_to_path(&inside, Some(&root)).is_ok());
         let outside = if cfg!(windows) { "file:///C:/other-root/f.py" } else { "file:///other-root/f.py" };
         assert!(uri_to_path(outside, Some(&root)).is_err());
+    }
+    // ── core #252: incomplete reviews ────────────────────────────────────────────────
+
+    const MESSAGE: &str = "IntentumDiff could not explain this change. Please report a bug at \
+        https://github.com/buchochelliq-labs/intentumdiff-core/issues/new (reason: \
+        unexplained_source_delta; language: bash; core: 0.1.0).";
+    const ISSUE_URL: &str =
+        "https://github.com/buchochelliq-labs/intentumdiff-core/issues/new?title=t&body=b";
+
+    fn incomplete_object(ranges: Value, truncated: bool) -> Value {
+        json!({
+            "reason": "unexplained_source_delta",
+            "message": MESSAGE,
+            "report_url": ISSUE_URL,
+            "language": "bash",
+            "core_version": "0.1.0",
+            "source_ranges": ranges,
+            "source_ranges_truncated": false,
+            "source_ranges_available": true,
+            "report": {
+                "title": "Incomplete review: unexplained_source_delta (bash, core 0.1.0)",
+                "body_markdown": "### IntentumDiff could not explain a change\n\n- region 1\n- region 2\n",
+                "truncated": truncated,
+                "issue_url": ISSUE_URL,
+                "outline": {"schema_version": 1},
+            },
+        })
+    }
+
+    fn hunk(new: (u64, u64), lines: (u64, u64)) -> Value {
+        json!({"old_start_byte": new.0, "old_end_byte": new.1, "new_start_byte": new.0,
+               "new_end_byte": new.1, "old_start_line": lines.0, "old_end_line": lines.1,
+               "new_start_line": lines.0, "new_end_line": lines.1})
+    }
+
+    #[test]
+    fn incomplete_diagnostics_carry_the_core_message_verbatim_on_its_source_ranges() {
+        // Line 1 is `é=1\n` (bytes 4..9); the hunk is that whole line plus a mid-line tail.
+        let source = "x=0\né=1\nyé=2";
+        let incomplete = incomplete_object(json!([hunk((4, 9), (1, 2)), hunk((12, 14), (2, 2))]), false);
+        let diags = incomplete_diagnostics(&incomplete, source, PositionEncoding::Utf16).unwrap();
+        assert_eq!(diags.len(), 2);
+        for d in &diags {
+            assert_eq!(d["message"], MESSAGE, "message must be core's text, verbatim");
+            assert_eq!(d["severity"], 3, "Information");
+            assert_eq!(d["code"], INCOMPLETE_CODE);
+            assert_eq!(d["source"], "intentumdiff");
+            assert!(d.get("codeDescription").is_none(), "no clickable report link");
+        }
+        assert_eq!(range_of(&diags[0]), ((1, 0), (2, 0)));
+        // `yé=2`: byte 12 is after `yé` (3 bytes, 2 UTF-16 units); byte 14 is EOF.
+        assert_eq!(range_of(&diags[1]), ((2, 2), (2, 4)));
+        let diags = incomplete_diagnostics(&incomplete, source, PositionEncoding::Utf8).unwrap();
+        assert_eq!(range_of(&diags[1]), ((2, 3), (2, 5)));
+        // No recorded ranges: still one diagnostic (never clean), at the top.
+        let diags = incomplete_diagnostics(&incomplete_object(json!([]), false), source,
+                                           PositionEncoding::Utf16).unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(range_of(&diags[0]), ((0, 0), (0, 0)));
+        assert_eq!(diags[0]["message"], MESSAGE);
+    }
+
+    #[test]
+    fn incomplete_ranges_from_a_foreign_buffer_are_refused() {
+        for bad in [hunk((4, 99), (1, 2)), hunk((4, 9), (0, 2)), hunk((5, 9), (1, 2))] {
+            let incomplete = incomplete_object(json!([bad]), false);
+            assert!(incomplete_diagnostics(&incomplete, "x=0\né=1\n", PositionEncoding::Utf8).is_err());
+        }
+    }
+
+    #[test]
+    fn only_an_incomplete_review_with_its_core_report_is_accepted() {
+        assert_eq!(incomplete_of(&json!({"completeness": "complete", "incomplete": null})), Ok(None));
+        assert_eq!(incomplete_of(&json!({"completeness": "equivalent", "incomplete": null})), Ok(None));
+        assert!(incomplete_of(&json!({"completeness": "incomplete", "incomplete": null})).is_err());
+        let object = incomplete_object(json!([]), false);
+        assert_eq!(incomplete_of(&json!({"completeness": "incomplete", "incomplete": object})),
+                   Ok(Some(object)));
+    }
+
+    fn incomplete_state(show_document: bool, truncated: bool) -> (ServerState, Value) {
+        let mut state = ServerState::new("HEAD".into(), String::new());
+        state.supports_show_document = show_document;
+        let incomplete = incomplete_object(json!([hunk((0, 4), (0, 1))]), truncated);
+        let diagnostics = incomplete_diagnostics(&incomplete, "x=1\n", PositionEncoding::Utf16).unwrap();
+        let mut out = Vec::new();
+        apply_outcome(&mut state, &mut out, "u", Some(7),
+                      Outcome::Diff { diagnostics, lenses: vec![], incomplete: Some(incomplete.clone()) });
+        let published = frames(&out);
+        let diags = published[0]["params"]["diagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1, "an incomplete review is never published as clean");
+        assert_eq!(diags[0]["message"], MESSAGE);
+        (state, incomplete)
+    }
+
+    fn client(state: &mut ServerState, msg: Value) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut dirty = Vec::new();
+        assert_eq!(handle_message(state, &mut out, msg, &mut dirty), None);
+        frames(&out)
+    }
+
+    /// codeAction → executeCommand; returns the preview request.
+    fn request_preview(state: &mut ServerState) -> Value {
+        let actions = client(state, json!({"jsonrpc": "2.0", "id": 1, "method": "textDocument/codeAction",
+            "params": {"textDocument": {"uri": "u"}, "range": {},
+                       "context": {"diagnostics": [{"code": INCOMPLETE_CODE, "message": MESSAGE}]}}}));
+        let action = &actions[0]["result"][0];
+        assert_eq!(action["title"], "Report IntentumDiff bug\u{2026}");
+        assert_eq!(action["diagnostics"][0]["code"], INCOMPLETE_CODE);
+        let command = action["command"].clone();
+        assert_eq!(command["arguments"], json!(["u", 7]));
+        let msgs = client(state, json!({"jsonrpc": "2.0", "id": 2, "method": "workspace/executeCommand",
+            "params": {"command": command["command"], "arguments": command["arguments"]}}));
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[0]["method"], "window/showMessageRequest");
+        assert!(msgs.iter().all(|m| m["method"] != "window/showDocument"), "never before Open");
+        assert_eq!(msgs[1]["id"], 2);
+        assert!(msgs[1]["result"].is_null());
+        msgs[0].clone()
+    }
+
+    #[test]
+    fn report_preview_shows_the_exact_title_and_body_and_opens_only_on_open() {
+        let (mut state, incomplete) = incomplete_state(true, false);
+        let preview = request_preview(&mut state);
+        let report = &incomplete["report"];
+        let message = preview["params"]["message"].as_str().unwrap();
+        let title = report["title"].as_str().unwrap();
+        let body = report["body_markdown"].as_str().unwrap();
+        assert!(message.starts_with(&format!("{title}\n\n{body}")), "{message}");
+        assert!(!message.contains("shortened"), "{message}");
+        assert!(!message.contains(ISSUE_URL), "the preview carries no extra data: {message}");
+        assert_eq!(preview["params"]["actions"], json!([{"title": "Open"}, {"title": "Cancel"}]));
+
+        // Cancel, dismissal (null), an unknown title and an error answer open nothing.
+        assert!(client(&mut state, json!({"jsonrpc": "2.0", "id": preview["id"],
+                                          "result": {"title": "Cancel"}})).is_empty());
+        for answer in [json!({"result": null}), json!({"result": {"title": "open"}}),
+                       json!({"error": {"code": -32800, "message": "cancelled"}})] {
+            let preview = request_preview(&mut state);
+            let mut response = json!({"jsonrpc": "2.0", "id": preview["id"]});
+            response.as_object_mut().unwrap().extend(answer.as_object().unwrap().clone());
+            assert!(client(&mut state, response).is_empty(), "no showDocument without Open");
+        }
+        assert!(state.pending_reports.is_empty());
+
+        // Open: exactly one external showDocument to report.issue_url.
+        let preview = request_preview(&mut state);
+        let msgs = client(&mut state, json!({"jsonrpc": "2.0", "id": preview["id"],
+                                             "result": {"title": "Open"}}));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["method"], "window/showDocument");
+        assert_eq!(msgs[0]["params"], json!({"uri": ISSUE_URL, "external": true}));
+        // A replayed answer opens nothing again.
+        assert!(client(&mut state, json!({"jsonrpc": "2.0", "id": preview["id"],
+                                          "result": {"title": "Open"}})).is_empty());
+    }
+
+    #[test]
+    fn a_truncated_report_says_so_and_previews_the_full_body() {
+        let (mut state, incomplete) = incomplete_state(true, true);
+        let preview = request_preview(&mut state);
+        let message = preview["params"]["message"].as_str().unwrap();
+        let report = &incomplete["report"];
+        assert!(message.starts_with(&format!("{}\n\n", report["title"].as_str().unwrap())));
+        assert!(message.contains("shortened body"), "{message}");
+        assert!(message.contains(report["body_markdown"].as_str().unwrap()), "full body: {message}");
+        let msgs = client(&mut state, json!({"jsonrpc": "2.0", "id": preview["id"],
+                                             "result": {"title": "Open"}}));
+        assert_eq!(msgs[0]["params"]["uri"], ISSUE_URL);
+    }
+
+    #[test]
+    fn without_show_document_support_open_hands_over_the_link_only() {
+        let (mut state, _) = incomplete_state(false, false);
+        let preview = request_preview(&mut state);
+        let msgs = client(&mut state, json!({"jsonrpc": "2.0", "id": preview["id"],
+                                             "result": {"title": "Open"}}));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["method"], "window/showMessage");
+        assert!(msgs[0]["params"]["message"].as_str().unwrap().contains(ISSUE_URL));
+    }
+
+    #[test]
+    fn the_report_action_follows_the_current_revision() {
+        let (mut state, _) = incomplete_state(true, false);
+        // A stale action (older version) is refused without a preview.
+        let msgs = client(&mut state, json!({"jsonrpc": "2.0", "id": 3, "method": "workspace/executeCommand",
+            "params": {"command": REPORT_COMMAND, "arguments": ["u", 6]}}));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["error"]["code"], -32602);
+        // A complete revision replaces the incomplete one: no action, command refused.
+        let mut out = Vec::new();
+        apply_outcome(&mut state, &mut out, "u", Some(8),
+                      Outcome::Diff { diagnostics: vec![], lenses: vec![], incomplete: None });
+        let actions = client(&mut state, json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/codeAction",
+            "params": {"textDocument": {"uri": "u"}, "range": {}, "context": {"diagnostics": []}}}));
+        assert_eq!(actions[0]["result"], json!([]));
+        let msgs = client(&mut state, json!({"jsonrpc": "2.0", "id": 5, "method": "workspace/executeCommand",
+            "params": {"command": REPORT_COMMAND, "arguments": ["u", 8]}}));
+        assert_eq!(msgs[0]["error"]["code"], -32602);
+        assert!(state.pending_reports.is_empty());
+    }
+
+    #[test]
+    fn initialize_advertises_the_report_action_and_reads_show_document_support() {
+        let mut state = ServerState::new("HEAD".into(), String::new());
+        let msgs = client(&mut state, json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"capabilities": {"window": {"showDocument": {"support": true}}}}}));
+        let caps = &msgs[0]["result"]["capabilities"];
+        assert_eq!(caps["codeActionProvider"], json!({"codeActionKinds": ["quickfix"]}));
+        assert_eq!(caps["executeCommandProvider"], json!({"commands": [REPORT_COMMAND]}));
+        assert!(state.supports_show_document);
     }
 }
