@@ -665,6 +665,102 @@ fn out_of_order_changes_cannot_overwrite_a_newer_revision() {
     finish(s, &base);
 }
 
+impl Session {
+    /// Drain frames until one satisfies `want` (returned); every frame is recorded in
+    /// `seen`. Server requests are NOT acknowledged here: the test answers them itself.
+    fn recv_until(&mut self, seen: &mut Vec<Value>, want: impl Fn(&Value) -> bool) -> Value {
+        loop {
+            let msg = self.recv();
+            seen.push(msg.clone());
+            if want(&msg) {
+                return msg;
+            }
+        }
+    }
+}
+
+/// Core #252: an array-element reorder the engine cannot explain is an INCOMPLETE review. The server
+/// publishes core's `incomplete.message` verbatim on core's `source_ranges` (never a clean,
+/// empty set), offers "Report IntentumDiff bug…", previews core's exact report, and opens
+/// `report.issue_url` externally only after the user picks Open.
+#[test]
+fn an_incomplete_review_is_reported_verbatim_and_opened_only_on_confirmation() {
+    let Some(wasm_dir) = acceptance_fixtures() else { return };
+    let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
+    let (old, new) = ("const a = [1, 2];\n", "const a = [2, 1];\n");
+    let (base, repo) = fixture_repo(&[("r.ts", old)]);
+    let uri = file_uri(&repo.join("r.ts"));
+
+    // The expected review, from the linked core with the same inputs.
+    let expected: Value = serde_json::from_str(
+        &intentumdiff_rust_core::live_server::live_diff_contents_impl(
+            &repo.to_string_lossy(), "r.ts", old, new, "{}", &wasm_dir.to_string_lossy(),
+        ).expect("core diff"),
+    ).unwrap();
+    let diff = &expected["diff"];
+    assert_eq!(diff["completeness"], "incomplete", "fixture must be incomplete: {expected}");
+    let incomplete = &diff["incomplete"];
+    let report = &incomplete["report"];
+
+    let mut s = spawn(bin, &repo, &wasm_dir);
+    s.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"rootUri": file_uri(&repo),
+                   "capabilities": {"window": {"showDocument": {"support": true}}}}}));
+    let init = s.recv_response(1);
+    assert_eq!(init["result"]["capabilities"]["executeCommandProvider"]["commands"],
+               json!(["intentumdiff.reportIncompleteReview"]));
+    s.send(&json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    s.send(&json!({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+        "params": {"textDocument": {"uri": uri, "languageId": "typescript", "version": 1, "text": new}}}));
+    let published = s.recv_publish(&uri);
+    let diagnostics = published["diagnostics"].as_array().unwrap();
+    let reported: Vec<&Value> = diagnostics.iter().filter(|d| d["code"] == "incomplete_review").collect();
+    let ranges = incomplete["source_ranges"].as_array().unwrap();
+    assert!(!ranges.is_empty());
+    assert_eq!(reported.len(), ranges.len(), "one diagnostic per source range: {published}");
+    for (d, r) in reported.iter().zip(ranges) {
+        assert_eq!(d["message"], incomplete["message"], "verbatim core message");
+        assert_eq!(d["severity"], 3);
+        assert_eq!(d["range"]["start"]["line"], r["new_start_line"]);
+        assert_eq!(d["range"]["end"]["line"], r["new_end_line"]);
+    }
+
+    // The code action → command → a preview of core's exact title and full body.
+    s.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/codeAction",
+        "params": {"textDocument": {"uri": uri}, "range": reported[0]["range"],
+                   "context": {"diagnostics": [reported[0]]}}}));
+    let actions = s.recv_response(2)["result"].clone();
+    assert_eq!(actions[0]["title"], "Report IntentumDiff bug\u{2026}");
+    let command = actions[0]["command"].clone();
+    let run = |s: &mut Session, id: i64| {
+        s.send(&json!({"jsonrpc": "2.0", "id": id, "method": "workspace/executeCommand",
+                       "params": {"command": command["command"], "arguments": command["arguments"]}}));
+    };
+    let mut seen = Vec::new();
+    run(&mut s, 3);
+    let preview = s.recv_until(&mut seen, |m| m["method"] == "window/showMessageRequest");
+    let message = preview["params"]["message"].as_str().unwrap();
+    assert!(message.starts_with(&format!("{}\n\n", report["title"].as_str().unwrap())), "{message}");
+    assert!(message.contains(report["body_markdown"].as_str().unwrap()), "{message}");
+    assert_eq!(preview["params"]["actions"], json!([{"title": "Open"}, {"title": "Cancel"}]));
+
+    // Cancel: nothing opens (a codeLens round-trip proves nothing was queued after it).
+    s.send(&json!({"jsonrpc": "2.0", "id": preview["id"], "result": {"title": "Cancel"}}));
+    s.send(&json!({"jsonrpc": "2.0", "id": 4, "method": "textDocument/codeLens",
+                   "params": {"textDocument": {"uri": uri}}}));
+    s.recv_until(&mut seen, |m| m["id"] == 4 && m.get("method").is_none());
+    assert!(seen.iter().all(|m| m["method"] != "window/showDocument"), "opened without Open: {seen:?}");
+
+    // Open: exactly core's issue_url, externally.
+    run(&mut s, 5);
+    let preview = s.recv_until(&mut seen, |m| m["method"] == "window/showMessageRequest");
+    s.send(&json!({"jsonrpc": "2.0", "id": preview["id"], "result": {"title": "Open"}}));
+    let shown = s.recv_until(&mut seen, |m| m["method"] == "window/showDocument");
+    assert_eq!(shown["params"], json!({"uri": report["issue_url"], "external": true}));
+    s.send(&json!({"jsonrpc": "2.0", "id": shown["id"], "result": {"success": true}}));
+    finish(s, &base);
+}
+
 fn spawn_bare_with(extra: &[&str]) -> Session {
     let bin = env!("CARGO_BIN_EXE_intentumdiff-lsp-server");
     let dir = std::env::temp_dir();
@@ -797,3 +893,4 @@ fn required_gate_rejects_unverified_tampered_or_unprovisioned_bundles() {
     assert!(verify_provisioned_bundle(&dir).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
