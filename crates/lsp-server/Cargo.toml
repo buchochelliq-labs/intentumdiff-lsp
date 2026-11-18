@@ -17,9 +17,13 @@ name = "intentumdiff-lsp-server"
 path = "src/main.rs"
 
 [dependencies]
-intentumdiff-rust-core = { git = "https://github.com/buchochelliq-labs/intentumdiff-core", rev = "80f9c5bf64ff42ef1b7ddf4124c6b19a7ca7695c", default-features = false }
+intentumdiff-rust-core = { git = "https://github.com/buchochelliq-labs/intentumdiff-core", rev = "74618c311836983b4f60ae2d8389edfdd14f7793", default-features = false }
 intentumdiff-lsp-client = { path = "../lsp-client" }
 serde_json = "1"
+
+[dev-dependencies]
+# Acceptance identities (component/binary SHA-256); already in the graph via the core.
+sha2 = "0.10"
 
 [patch.crates-io]
 quote = { path = "../../patches/quote" }
